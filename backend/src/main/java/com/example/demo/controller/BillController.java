@@ -1,7 +1,6 @@
 package com.example.demo.controller;
 
 import java.util.List;
-import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -23,31 +22,55 @@ public class BillController {
     @Autowired
     private BillRepository billRepository;
 
+    @PostMapping
+    public ResponseEntity<?> createBill(@RequestBody Bill newBill) {
+        try {
+            System.out.println("=== Incoming Bill Data ===");
+            System.out.println("Vendor: " + newBill.getVendorName());
+            System.out.println("Bill No: " + newBill.getBillNo());
+            System.out.println("Amount: " + newBill.getAmount());
+
+            // 1. Prevent crash on null amount
+            if (newBill.getAmount() == null) {
+                newBill.setAmount(0.0);
+            }
+
+            // 2. Duplicate Check
+            if (newBill.getBillNo() != null && !newBill.getBillNo().equalsIgnoreCase("Unknown ID")) {
+                List<Bill> all = billRepository.findAll();
+                boolean exists = all.stream().anyMatch(b -> 
+                    newBill.getBillNo().equalsIgnoreCase(b.getBillNo())
+                );
+                if (exists) {
+                    System.out.println("⚠️ Rejection: Duplicate Bill Number detected.");
+                    return ResponseEntity.badRequest().body("Error: Bill already exists.");
+                }
+            }
+
+            // 3. Calculation Logic
+            List<Bill> allBills = billRepository.findAll();
+            Double prevTotal = 0.0;
+            if (!allBills.isEmpty()) {
+                Bill last = allBills.get(allBills.size() - 1);
+                prevTotal = (last.getRunningTotal() != null) ? last.getRunningTotal() : 0.0;
+            }
+            newBill.setRunningTotal(prevTotal + newBill.getAmount());
+
+            // 4. Final Save
+            System.out.println("💾 Saving to database...");
+            Bill saved = billRepository.save(newBill);
+            System.out.println("✅ Save Successful!");
+            return ResponseEntity.ok(saved);
+
+        } catch (Exception e) {
+            System.err.println("❌ JAVA CRASHED: " + e.getMessage());
+            e.printStackTrace(); // This prints the full error stack trace
+            return ResponseEntity.status(500).body("Internal Error: " + e.getMessage());
+        }
+    }
+
     @GetMapping
     public List<Bill> getAllBills() {
         return billRepository.findAll();
-    }
-
-    @PostMapping
-    public ResponseEntity<?> createBill(@RequestBody Bill newBill) {
-        // 1. Duplicate Check
-        if (newBill.getBillNo() != null && !newBill.getBillNo().equals("Unknown ID")) {
-            Optional<Bill> existingBill = billRepository.findAll().stream()
-                .filter(b -> newBill.getBillNo().equalsIgnoreCase(b.getBillNo()))
-                .findFirst();
-
-            if (existingBill.isPresent()) {
-                return ResponseEntity.badRequest().body("Error: Bill " + newBill.getBillNo() + " already exists!");
-            }
-        }
-
-        // 2. Automated Running Total Calculation
-        List<Bill> allBills = billRepository.findAll();
-        double previousTotal = allBills.isEmpty() ? 0.0 : allBills.get(allBills.size() - 1).getRunningTotal();
-        newBill.setRunningTotal(previousTotal + newBill.getAmount());
-
-        // 3. Save (Timestamp is handled automatically by the Entity @PrePersist)
-        Bill savedBill = billRepository.save(newBill);
-        return ResponseEntity.ok(savedBill);
     }
 }
