@@ -1,11 +1,17 @@
 package com.example.demo.controller;
 
+import java.util.List;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
 import com.example.demo.entity.Bill;
 import com.example.demo.repository.BillRepository;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
 
 @RestController
 @RequestMapping("/api/bills")
@@ -24,6 +30,7 @@ public class BillController {
     // 2. POST DOOR: This receives a new bill from the frontend and saves it
     @PostMapping
     public Bill createBill(@RequestBody Bill bill) {
+        bill.setTimestamp(java.time.LocalDateTime.now()); // Automatically stamps the current date and time!
         return billRepository.save(bill);
     }
 }
