@@ -6,7 +6,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -72,5 +74,32 @@ public class BillController {
     @GetMapping
     public List<Bill> getAllBills() {
         return billRepository.findAll();
+    }
+    // Conveyor Belt Status Update (Faculty -> Storekeeper -> Principal)
+    @PutMapping("/{id}/status")
+    public ResponseEntity<?> updateBillStatus(
+            @PathVariable Long id,
+            @RequestBody java.util.Map<String, String> payload) {
+
+        java.util.Optional<com.example.demo.entity.Bill> billOpt = billRepository.findById(id);
+        if (billOpt.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.NOT_FOUND)
+                    .body(java.util.Map.of("message", "Bill with ID " + id + " not found."));
+        }
+
+        com.example.demo.entity.Bill bill = billOpt.get();
+
+        if (payload.containsKey("status")) {
+            bill.setStatus(payload.get("status"));
+        }
+
+        if (payload.containsKey("remark") && payload.get("remark") != null && !payload.get("remark").isBlank()) {
+            String remark = payload.get("remark");
+            String existingDesc = bill.getDescription() != null ? bill.getDescription() : "";
+            bill.setDescription((existingDesc + " | Audit Note: " + remark).trim());
+        }
+
+        com.example.demo.entity.Bill updatedBill = billRepository.save(bill);
+        return ResponseEntity.ok(updatedBill);
     }
 }
