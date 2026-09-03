@@ -149,16 +149,3 @@ npm run dev
 
 ---
 
-## Git Workflow & Synchronization
-
-To push local enhancements to the shared repository:
-```powershell
-# Stage all modified and untracked files
-git add .
-
-# Commit changes with descriptive summary
-git commit -m "docs: finalized README documentation and deployment guide"
-
-# Push to active upstream branch
-git push origin HEAD
-```
