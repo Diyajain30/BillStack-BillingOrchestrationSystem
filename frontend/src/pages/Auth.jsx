@@ -22,7 +22,7 @@ export default function Auth() {
     if (error) setError('');
   };
 
-  const handleSubmit = async (e) => {
+  const handleSubmit = async(e) => {
     e.preventDefault();
     setError('');
 
@@ -86,6 +86,8 @@ export default function Auth() {
   return (
     <div className="min-h-screen bg-violet-950 flex items-center justify-center p-4">
       <div className="bg-white w-full max-w-md p-8 rounded-2xl shadow-2xl">
+        
+        {/* Header */}
         <div className="text-center mb-6">
           <h2 className="text-3xl font-bold text-violet-950">
             {isLogin ? 'Welcome Back' : 'Create Account'}
@@ -97,28 +99,17 @@ export default function Auth() {
           </p>
         </div>
 
+        {/* Error Alert */}
         {error && (
           <div className="mb-4 p-3 bg-red-100 border border-red-300 text-red-700 text-sm rounded-lg">
             {error}
           </div>
         )}
 
+        {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-semibold text-violet-900 mb-1">
-              Username
-            </label>
-            <input
-              type="text"
-              name="username"
-              placeholder="Enter your username"
-              value={formData.username}
-              onChange={handleChange}
-              required
-              className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900"
-            />
-          </div>
-
+          
+          {/* Sign Up Fields */}
           {!isLogin && (
             <>
               <div>
@@ -170,6 +161,7 @@ export default function Auth() {
             </select>
           </div>
 
+          {/* Password */}
           <div>
             <label className="block text-sm font-semibold text-violet-900 mb-1">
               Password
@@ -185,6 +177,7 @@ export default function Auth() {
             />
           </div>
 
+          {/* Action Button */}
           <button
             type="submit"
             disabled={loading}
@@ -194,6 +187,7 @@ export default function Auth() {
           </button>
         </form>
 
+        {/* Mode Toggle */}
         <div className="text-center mt-6">
           <p className="text-sm text-gray-600">
             {isLogin ? "Don't have an account?" : 'Already have an account?'}

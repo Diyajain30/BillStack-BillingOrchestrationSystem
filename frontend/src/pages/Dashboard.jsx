@@ -42,11 +42,9 @@ export default function Dashboard() {
 
     case 'ADMIN':
     case 'PRINCIPAL':
-      return <AdminDashboard user={user} />;
-
     case 'STOREKEEPER':
     case 'STORE':
-      return <StorekeeperDashboard user={user} />;
+      return <AdminDashboard user={user} />;
 
     default:
       return (
