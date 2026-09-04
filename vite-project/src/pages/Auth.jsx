@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import axios from 'axios';
 
 export default function Auth() {
   const navigate = useNavigate();
@@ -22,7 +21,7 @@ export default function Auth() {
     if (error) setError('');
   };
 
-  const handleSubmit = async(e) => {
+  const handleSubmit = (e) => {
     e.preventDefault();
     setError('');
 
@@ -33,54 +32,16 @@ export default function Auth() {
 
     setLoading(true);
 
-    try {
-      if (!isLogin) {
-        // --- LIVE SIGNUP ---
-        const userPayload = {
-          username: formData.username || formData.name,
-          password: formData.password,
-          role: formData.role.toUpperCase(),
-        };
-
-        const response = await axios.post('http://localhost:8080/api/users', userPayload);
-
-        if (response.status === 200 || response.status === 201) {
-          alert('Account created successfully in database! Please log in.');
-          
-          // Clear inputs & switch back to login mode cleanly
-          setFormData({
-            username: '',
-            password: '',
-            name: '',
-            enrollmentId: '',
-            role: 'Student',
-          });
-          setIsLogin(true);
-        }
-      } else {
-        // --- LIVE LOGIN MODE ---
-        const response = await axios.post('http://localhost:8080/api/users/login', {
-          username: formData.username,
-          password: formData.password,
-        });
-
-        if (response.status === 200) {
-          const loggedInUser = response.data;
-          localStorage.setItem('user', JSON.stringify(loggedInUser));
-          alert(`Welcome back, ${loggedInUser.username}!`);
-          navigate('/dashboard', { state: { user: loggedInUser } });
-        }
-      }
-    } catch (err) {
-      console.error('API Error:', err);
-      setError(
-        err.response?.data?.message ||
-        (typeof err.response?.data === 'string' ? err.response.data : null) ||
-        'Authentication failed. Please check your connection or database.'
-      );
-    } finally {
+    setTimeout(() => {
       setLoading(false);
-    }
+
+      // Pass user info along with the selected role
+      const userPayload = isLogin
+        ? { username: formData.username, role: formData.role }
+        : { name: formData.name, enrollmentId: formData.enrollmentId, role: formData.role };
+
+      navigate('/dashboard', { state: { user: userPayload } });
+    }, 1000);
   };
 
   return (
@@ -144,6 +105,25 @@ export default function Auth() {
             </>
           )}
 
+          {/* Login Field */}
+          {isLogin && (
+            <div>
+              <label className="block text-sm font-semibold text-violet-900 mb-1">
+                Username
+              </label>
+              <input
+                type="text"
+                name="username"
+                placeholder="Enter your username"
+                value={formData.username}
+                onChange={handleChange}
+                required
+                className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900"
+              />
+            </div>
+          )}
+
+          {/* Role Selection */}
           <div>
             <label className="block text-sm font-semibold text-violet-900 mb-1">
               Select Role
@@ -203,6 +183,7 @@ export default function Auth() {
             </button>
           </p>
         </div>
+
       </div>
     </div>
   );
