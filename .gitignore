@@ -1,3 +1,6 @@
+# ===============================
+# Backend (Java / Spring Boot / Maven)
+# ===============================
 target/
 pom.xml.tag
 pom.xml.releaseBackup
@@ -7,11 +10,52 @@ release.properties
 dependency-reduced-pom.xml
 buildNumber.properties
 .mvn/timing.properties
-# https://maven.apache.org/tools/wrapper/#Usage_with_or_without_Binary_JAR
 .mvn/wrapper/maven-wrapper.jar
 
-# Eclipse m2e generated files
-# Eclipse Core
+# ===============================
+# Frontend (Node / React / Vite)
+# ===============================
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+dist-ssr/
+*.local
+
+# ===============================
+# OCR Microservice (Python / FastAPI)
+# ===============================
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+ocr-service/venv/
+ocr-service/.venv/
+*.egg-info/
+
+# ===============================
+# Environment & Secrets
+# ===============================
+.env
+.env*.local
+*.env
+
+# ===============================
+# IDE & Editor Configurations
+# ===============================
+.vscode/
+.idea/
+*.iml
+*.iws
 .project
-# JDT-specific (Eclipse Java Development Tools)
 .classpath
+.settings/
+
+# ===============================
+# Operating System Artifacts
+# ===============================
+.DS_Store
+Thumbs.db
