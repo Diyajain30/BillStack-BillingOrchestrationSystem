@@ -22,7 +22,7 @@ export default function Auth() {
     if (error) setError('');
   };
 
-  const handleSubmit = async(e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
 
@@ -38,6 +38,8 @@ export default function Auth() {
         // --- LIVE SIGNUP ---
         const userPayload = {
           username: formData.username || formData.name,
+          name: formData.name,
+          enrollmentId: formData.enrollmentId,
           password: formData.password,
           role: formData.role.toUpperCase(),
         };
@@ -109,7 +111,7 @@ export default function Auth() {
         {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-4">
           
-          {/* Sign Up Fields */}
+          {/* Sign Up Fields (Only shown during Registration) */}
           {!isLogin && (
             <>
               <div>
@@ -144,21 +146,20 @@ export default function Auth() {
             </>
           )}
 
+          {/* Username Field (Available for both Login and Registration) */}
           <div>
             <label className="block text-sm font-semibold text-violet-900 mb-1">
-              Select Role
+              Username
             </label>
-            <select
-              name="role"
-              value={formData.role}
+            <input
+              type="text"
+              name="username"
+              placeholder="Enter your username"
+              value={formData.username}
               onChange={handleChange}
-              className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900 bg-white"
-            >
-              <option value="Student">Student</option>
-              <option value="Teacher">Teacher / Faculty</option>
-              <option value="Admin">Admin / Principal</option>
-              <option value="Storekeeper">Storekeeper</option>
-            </select>
+              required
+              className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900"
+            />
           </div>
 
           {/* Password */}
@@ -175,6 +176,24 @@ export default function Auth() {
               required
               className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900"
             />
+          </div>
+
+          {/* Role Selection */}
+          <div>
+            <label className="block text-sm font-semibold text-violet-900 mb-1">
+              Select Role
+            </label>
+            <select
+              name="role"
+              value={formData.role}
+              onChange={handleChange}
+              className="w-full px-4 py-2 border border-violet-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-600 text-slate-900 bg-white"
+            >
+              <option value="Student">Student</option>
+              <option value="Teacher">Teacher / Faculty</option>
+              <option value="Admin">Admin / Principal</option>
+              <option value="Storekeeper">Storekeeper</option>
+            </select>
           </div>
 
           {/* Action Button */}
