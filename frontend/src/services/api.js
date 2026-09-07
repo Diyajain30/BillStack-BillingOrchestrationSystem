@@ -1,6 +1,5 @@
 import axios from 'axios';
 
-// Calls Spring Boot backend via Vite proxy (port 8080)
 export const backendApi = axios.create({
   baseURL: '/api',
   headers: {
@@ -8,7 +7,6 @@ export const backendApi = axios.create({
   },
 });
 
-// Calls FastAPI OCR service via Vite proxy (port 5000)
 export const ocrApi = axios.create({
   baseURL: '/extract-bill',
   headers: {

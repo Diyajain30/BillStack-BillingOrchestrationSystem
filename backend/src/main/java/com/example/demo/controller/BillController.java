@@ -1,8 +1,11 @@
 package com.example.demo.controller;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -11,95 +14,117 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.demo.entity.Bill;
 import com.example.demo.repository.BillRepository;
+import com.example.demo.repository.SubEventRepository;
 
 @RestController
 @RequestMapping("/api/bills")
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = "http://localhost:3000")
 public class BillController {
 
     @Autowired
     private BillRepository billRepository;
 
-    @PostMapping
-    public ResponseEntity<?> createBill(@RequestBody Bill newBill) {
-        try {
-            System.out.println("=== Incoming Bill Data ===");
-            System.out.println("Vendor: " + newBill.getVendorName());
-            System.out.println("Bill No: " + newBill.getBillNo());
-            System.out.println("Amount: " + newBill.getAmount());
+    @Autowired
+    private SubEventRepository subEventRepository;
 
-            // 1. Prevent crash on null amount
-            if (newBill.getAmount() == null) {
-                newBill.setAmount(0.0);
-            }
-
-            // 2. Duplicate Check
-            if (newBill.getBillNo() != null && !newBill.getBillNo().equalsIgnoreCase("Unknown ID")) {
-                List<Bill> all = billRepository.findAll();
-                boolean exists = all.stream().anyMatch(b -> 
-                    newBill.getBillNo().equalsIgnoreCase(b.getBillNo())
-                );
-                if (exists) {
-                    System.out.println("⚠️ Rejection: Duplicate Bill Number detected.");
-                    return ResponseEntity.badRequest().body("Error: Bill already exists.");
-                }
-            }
-
-            // 3. Calculation Logic
-            List<Bill> allBills = billRepository.findAll();
-            Double prevTotal = 0.0;
-            if (!allBills.isEmpty()) {
-                Bill last = allBills.get(allBills.size() - 1);
-                prevTotal = (last.getRunningTotal() != null) ? last.getRunningTotal() : 0.0;
-            }
-            newBill.setRunningTotal(prevTotal + newBill.getAmount());
-
-            // 4. Final Save
-            System.out.println("💾 Saving to database...");
-            Bill saved = billRepository.save(newBill);
-            System.out.println("✅ Save Successful!");
-            return ResponseEntity.ok(saved);
-
-        } catch (Exception e) {
-            System.err.println("❌ JAVA CRASHED: " + e.getMessage());
-            e.printStackTrace(); // This prints the full error stack trace
-            return ResponseEntity.status(500).body("Internal Error: " + e.getMessage());
-        }
-    }
-
+    // GET /api/bills - Scoped by subEventId query param
     @GetMapping
-    public List<Bill> getAllBills() {
-        return billRepository.findAll();
+    public ResponseEntity<List<Bill>> getAllBills(@RequestParam(required = false) Long subEventId) {
+        List<Bill> all = billRepository.findAll();
+        if (subEventId != null) {
+            List<Bill> filtered = all.stream()
+                    .filter(b -> subEventId.equals(b.getSubEventId()))
+                    .toList();
+            return ResponseEntity.ok(filtered);
+        }
+        return ResponseEntity.ok(all);
     }
-    // Conveyor Belt Status Update (Faculty -> Storekeeper -> Principal)
-    @PutMapping("/{id}/status")
-    public ResponseEntity<?> updateBillStatus(
-            @PathVariable Long id,
-            @RequestBody java.util.Map<String, String> payload) {
 
-        java.util.Optional<com.example.demo.entity.Bill> billOpt = billRepository.findById(id);
-        if (billOpt.isEmpty()) {
-            return ResponseEntity.status(org.springframework.http.HttpStatus.NOT_FOUND)
-                    .body(java.util.Map.of("message", "Bill with ID " + id + " not found."));
+    // POST /api/bills - Attach subEventId and compute folder-specific running total
+    @PostMapping
+    public ResponseEntity<?> createBill(@RequestBody Bill bill) {
+        if (bill.getVendorName() == null || bill.getAmount() == null) {
+            return ResponseEntity.badRequest().body(Map.of("message", "Vendor name and amount are required."));
         }
 
-        com.example.demo.entity.Bill bill = billOpt.get();
+        // Calculate running total strictly within this sub-event folder
+        List<Bill> existing = billRepository.findAll();
+        double folderRunningTotal = existing.stream()
+                .filter(b -> bill.getSubEventId() != null && bill.getSubEventId().equals(b.getSubEventId()))
+                .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
+                .sum();
+        bill.setRunningTotal(folderRunningTotal + bill.getAmount());
+
+        if (bill.getStatus() == null || bill.getStatus().isBlank()) {
+            bill.setStatus("PENDING_FACULTY");
+        }
+
+        Bill saved = billRepository.save(bill);
+
+        // Update SubEvent totalSpent
+        if (saved.getSubEventId() != null) {
+            subEventRepository.findById(saved.getSubEventId()).ifPresent(se -> {
+                double spent = billRepository.findAll().stream()
+                        .filter(b -> saved.getSubEventId().equals(b.getSubEventId()))
+                        .filter(b -> !"REJECTED".equalsIgnoreCase(b.getStatus()))
+                        .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
+                        .sum();
+                se.setTotalSpent(spent);
+                subEventRepository.save(se);
+            });
+        }
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(saved);
+    }
+
+    // PUT /api/bills/{id}/status - Update bill status and audit note
+    @PutMapping("/{id}/status")
+    public ResponseEntity<?> updateBillStatus(@PathVariable Long id, @RequestBody Map<String, Object> payload) {
+        Optional<Bill> billOpt = billRepository.findById(id);
+        if (billOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Bill bill = billOpt.get();
 
         if (payload.containsKey("status")) {
-            bill.setStatus(payload.get("status"));
+            bill.setStatus((String) payload.get("status"));
         }
+        if (payload.containsKey("vendorName")) bill.setVendorName((String) payload.get("vendorName"));
+        if (payload.containsKey("billNo")) bill.setBillNo((String) payload.get("billNo"));
+        if (payload.containsKey("billDate")) bill.setBillDate((String) payload.get("billDate"));
+        if (payload.containsKey("vendorGstin")) bill.setVendorGstin((String) payload.get("vendorGstin"));
+        if (payload.containsKey("amount")) bill.setAmount(Double.valueOf(payload.get("amount").toString()));
+        if (payload.containsKey("baseAmount")) bill.setBaseAmount(Double.valueOf(payload.get("baseAmount").toString()));
+        if (payload.containsKey("cgst")) bill.setCgst(Double.valueOf(payload.get("cgst").toString()));
+        if (payload.containsKey("sgst")) bill.setSgst(Double.valueOf(payload.get("sgst").toString()));
 
-        if (payload.containsKey("remark") && payload.get("remark") != null && !payload.get("remark").isBlank()) {
-            String remark = payload.get("remark");
+        if (payload.containsKey("remark")) {
+            String remark = (String) payload.get("remark");
             String existingDesc = bill.getDescription() != null ? bill.getDescription() : "";
-            bill.setDescription((existingDesc + " | Audit Note: " + remark).trim());
+            bill.setDescription(existingDesc + " | Note: " + remark);
         }
 
-        com.example.demo.entity.Bill updatedBill = billRepository.save(bill);
-        return ResponseEntity.ok(updatedBill);
+        Bill updated = billRepository.save(bill);
+
+        // Recalculate SubEvent totalSpent
+        if (updated.getSubEventId() != null) {
+            subEventRepository.findById(updated.getSubEventId()).ifPresent(se -> {
+                double spent = billRepository.findAll().stream()
+                        .filter(b -> updated.getSubEventId().equals(b.getSubEventId()))
+                        .filter(b -> !"REJECTED".equalsIgnoreCase(b.getStatus()))
+                        .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
+                        .sum();
+                se.setTotalSpent(spent);
+                subEventRepository.save(se);
+            });
+        }
+
+        return ResponseEntity.ok(updated);
     }
 }
