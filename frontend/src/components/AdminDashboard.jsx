@@ -16,6 +16,7 @@ export default function AdminDashboard({ user }) {
   const [activeTab, setActiveTab] = useState('Folders'); // 'Folders', 'Queue', 'Ledger'
   const [bills, setBills] = useState([]);
   const [subEvents, setSubEvents] = useState([]);
+  const [masterEvent, setMasterEvent] = useState(null);
   const [loading, setLoading] = useState(false);
 
   // Folder View State
@@ -33,16 +34,22 @@ export default function AdminDashboard({ user }) {
   const [rejectionReason, setRejectionReason] = useState('Budget quota exceeded');
   const [actionLoading, setActionLoading] = useState(false);
 
-  // 1. Fetch live bills and sub-event folders from Spring Boot
+  // 1. Fetch live bills, master event, and sub-events from Spring Boot
   const fetchData = async () => {
     setLoading(true);
     try {
       const [billsRes, eventsRes] = await Promise.all([
         backendApi.get('/bills').catch(() => ({ data: [] })),
-        axios.get('http://localhost:8080/api/subevents').catch(() => ({ data: [] })),
+        backendApi.get('/events').catch(() => axios.get('http://localhost:8080/api/subevents').catch(() => ({ data: [] }))),
       ]);
+
+      const allEvents = Array.isArray(eventsRes.data) ? eventsRes.data : [];
+      const foundMaster = allEvents.find((ev) => ev.parentEventId === null || ev.parentEventId === undefined);
+      const foundSubs = allEvents.filter((ev) => ev.parentEventId !== null && ev.parentEventId !== undefined);
+
+      setMasterEvent(foundMaster || null);
+      setSubEvents(foundSubs.length > 0 ? foundSubs : allEvents);
       setBills(Array.isArray(billsRes.data) ? billsRes.data : []);
-      setSubEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
     } catch (error) {
       console.error('Failed to sync data:', error);
     } finally {
@@ -79,7 +86,7 @@ export default function AdminDashboard({ user }) {
     setActionLoading(true);
     try {
       await backendApi.put(`/bills/${selectedBill.id}/status`, {
-        status: 'PENDING_STOREKEEPER',
+        status: 'APPROVED', // Advances pipeline to next stage
         remark: auditRemark || 'Executive financial sanction granted by Principal. Forwarded to Storekeeper.',
       });
       alert(`Bill #${selectedBill.billNo} sanctioned and forwarded to Storekeeper for ledger logging!`);
@@ -115,15 +122,16 @@ export default function AdminDashboard({ user }) {
     }
   };
 
-  // REJECTION HANDLER (Returns bill to Coordinator)
+  // REJECTION HANDLER WITH REASON & ROLE TRACKING
   const handleConfirmReject = async () => {
     if (!selectedBill) return;
     setActionLoading(true);
     try {
       await backendApi.put(`/bills/${selectedBill.id}/status`, {
         status: 'REJECTED',
-        remark: auditRemark,
+        remark: auditRemark || 'Disapproved during audit review',
         rejectionReason: rejectionReason,
+        rejectedBy: isStorekeeper ? 'STOREKEEPER' : 'PRINCIPAL',
       });
       alert(`Bill #${selectedBill.billNo} disapproved and kicked back to Event Coordinator.`);
       closeModals();
@@ -137,7 +145,7 @@ export default function AdminDashboard({ user }) {
     }
   };
 
-  // Duplex Audit Voucher PDF Generator
+  // Single Bill Duplex Audit Voucher PDF Generator
   const generateVoucherPdf = (bill) => {
     const doc = new jsPDF();
     doc.setFont('helvetica', 'bold');
@@ -169,8 +177,145 @@ export default function AdminDashboard({ user }) {
     doc.save(`Certified_Voucher_${bill.billNo || bill.id}.pdf`);
   };
 
+  // COMPREHENSIVE MASTER EVENT FOLDER PDF EXPORT
+  const generateMasterEventPdf = () => {
+    const doc = new jsPDF();
+    const festName = masterEvent ? (masterEvent.name || masterEvent.wingName) : 'WINGS Master Event Portfolio';
+    
+    doc.setFillColor(46, 16, 101);
+    doc.rect(0, 0, 210, 35, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(18);
+    doc.setFont('helvetica', 'bold');
+    doc.text('BILLSTACK MASTER EVENT AUDIT FOLDER', 14, 18);
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    doc.text(`Master Event: ${festName} | Generated: ${new Date().toLocaleDateString()}`, 14, 27);
+
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.text('1. Master Event Financial Overview', 14, 45);
+
+    const totalBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
+    const totalSpent = bills.filter(b => b.status === 'APPROVED').reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+
+    doc.autoTable({
+      startY: 50,
+      head: [['Master Event Title', 'Total Sanctioned Budget', 'Total Approved Spend', 'Status']],
+      body: [
+        [festName, `Rs. ${totalBudget?.toLocaleString('en-IN')}`, `Rs. ${totalSpent?.toLocaleString('en-IN')}`, masterEvent?.status || 'ACTIVE']
+      ],
+      theme: 'striped',
+      headStyles: { fillColor: [76, 29, 149] }
+    });
+
+    let currentY = doc.lastAutoTable.finalY + 15;
+    doc.text('2. Nested Sub-Events Breakdown', 14, currentY);
+
+    const subEventRows = subEvents.map((s) => [
+      `#${s.id}`,
+      s.name,
+      s.department,
+      `Rs. ${s.budgetCap?.toLocaleString('en-IN')}`,
+      `Rs. ${s.totalSpent?.toLocaleString('en-IN') || 0}`
+    ]);
+
+    doc.autoTable({
+      startY: currentY + 5,
+      head: [['ID', 'Sub-Event Name', 'Department', 'Budget Cap', 'Spent to Date']],
+      body: subEventRows,
+      theme: 'grid',
+      headStyles: { fillColor: [76, 29, 149] }
+    });
+
+    currentY = doc.lastAutoTable.finalY + 15;
+    doc.text('3. Itemized Bills Ledger (All Sub-Events)', 14, currentY);
+
+    const billRows = bills.map((b) => [
+      `#${b.billNo || b.id}`,
+      b.vendorName || 'N/A',
+      b.eventName || 'General',
+      `Rs. ${Number(b.amount).toFixed(2)}`,
+      b.status
+    ]);
+
+    doc.autoTable({
+      startY: currentY + 5,
+      head: [['Invoice No', 'Vendor', 'Sub-Event / Event', 'Amount', 'Status']],
+      body: billRows,
+      theme: 'striped',
+      headStyles: { fillColor: [76, 29, 149] }
+    });
+
+    doc.save(`${festName.replace(/\s+/g, '_')}_Master_Audit_Folder.pdf`);
+  };
+
+  // INDIVIDUAL SUB-EVENT FOLDER PDF EXPORT
+  const generateSubEventPdf = (sub) => {
+    const doc = new jsPDF();
+    const folderBills = bills.filter(
+      (b) =>
+        (b.subEventId && String(b.subEventId) === String(sub.id)) ||
+        (b.eventName && b.eventName.toLowerCase().trim() === sub.name.toLowerCase().trim())
+    );
+    const subSpent = folderBills.reduce((acc, b) => acc + (Number(b.amount) || 0), 0);
+
+    doc.setFillColor(30, 41, 59);
+    doc.rect(0, 0, 210, 35, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(16);
+    doc.setFont('helvetica', 'bold');
+    doc.text('SUB-EVENT AUDIT PORTFOLIO FOLDER', 14, 18);
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    doc.text(`Sub-Event: ${sub.name} (${sub.department}) | ID: #${sub.id}`, 14, 27);
+
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.text('1. Sub-Event Financial Summary', 14, 45);
+
+    doc.autoTable({
+      startY: 50,
+      head: [['Department', 'Sanctioned Budget', 'Advance Disbursed', 'Total Spent', 'Balance']],
+      body: [
+        [
+          sub.department,
+          `Rs. ${sub.budgetCap?.toLocaleString('en-IN')}`,
+          `Rs. ${sub.advanceDisbursed?.toLocaleString('en-IN') || 0}`,
+          `Rs. ${subSpent.toLocaleString('en-IN')}`,
+          `Rs. ${(sub.budgetCap - subSpent).toLocaleString('en-IN')}`
+        ]
+      ],
+      theme: 'striped',
+      headStyles: { fillColor: [51, 65, 85] }
+    });
+
+    let currentY = doc.lastAutoTable.finalY + 15;
+    doc.text('2. Itemized Bills under this Folder', 14, currentY);
+
+    const bRows = folderBills.map((b) => [
+      `#${b.billNo || b.id}`,
+      b.vendorName || 'N/A',
+      b.billDate || 'N/A',
+      `Rs. ${Number(b.amount).toFixed(2)}`,
+      b.status
+    ]);
+
+    doc.autoTable({
+      startY: currentY + 5,
+      head: [['Invoice No', 'Vendor', 'Date', 'Amount', 'Status']],
+      body: bRows,
+      theme: 'grid',
+      headStyles: { fillColor: [51, 65, 85] }
+    });
+
+    doc.save(`SubEvent_${sub.name.replace(/\s+/g, '_')}_Audit_Folder.pdf`);
+  };
+
   // Metric Computations
-  const totalFestBudget = subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
+  const totalFestBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
   const totalFestAdvance = subEvents.reduce((acc, s) => acc + (Number(s.advanceDisbursed) || 0), 0);
   const totalSanctionedOutflow = bills
     .filter((b) => b.status === 'APPROVED' || b.status === 'PENDING_STOREKEEPER')
@@ -293,16 +438,24 @@ export default function AdminDashboard({ user }) {
             <h1 className="text-2xl font-black text-white tracking-tight">{roleTitle}</h1>
             <p className="text-xs text-slate-400 mt-1">
               {isStorekeeper
-                ? 'Review Principal-sanctioned bills, enter stock book records, and grant final sign-off.'
+                ? 'Review Principal-sanctioned bills, enter stock book records, and download event folders.'
                 : 'Sub-event folder auditing: Grant executive financial sanction or return bills with feedback.'}
             </p>
           </div>
-          <button
-            onClick={fetchData}
-            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-bold text-slate-200 shadow-sm transition"
-          >
-            ↻ Sync Live Database
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={generateMasterEventPdf}
+              className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-bold text-white shadow-md transition flex items-center gap-1.5"
+            >
+              📥 Download Master Event Folder (PDF)
+            </button>
+            <button
+              onClick={fetchData}
+              className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-bold text-slate-200 shadow-sm transition"
+            >
+              ↻ Sync
+            </button>
+          </div>
         </header>
 
         {/* 4 Real-Time Executive Metric Cards */}
@@ -331,7 +484,7 @@ export default function AdminDashboard({ user }) {
           </div>
         </section>
 
-        {/* ─── TAB 1: SUB-EVENT FOLDERS (PRINCIPAL CONTEXTUAL AUDIT) ─── */}
+        {/* ─── TAB 1: SUB-EVENT FOLDERS ─── */}
         {activeTab === 'Folders' && (
           <section className="mt-8 space-y-4">
             <div className="flex justify-between items-center">
@@ -339,7 +492,7 @@ export default function AdminDashboard({ user }) {
                 <h2 className="text-base font-black text-slate-100 flex items-center gap-2">
                   <span>📁</span> Sub-Event Folders & Budgets ({subEvents.length})
                 </h2>
-                <p className="text-xs text-slate-400">Click any folder to inspect its assigned faculty heads, spending, and bill queue.</p>
+                <p className="text-xs text-slate-400">Click any folder to inspect particulars or download its individual PDF folder.</p>
               </div>
             </div>
 
@@ -363,10 +516,9 @@ export default function AdminDashboard({ user }) {
                   return (
                     <div
                       key={evt.id}
-                      onClick={() => openFolderDetails(evt.id)}
-                      className="bg-slate-800/60 border border-slate-700/80 hover:border-indigo-500 rounded-2xl p-5 space-y-4 cursor-pointer transition shadow-sm hover:shadow-md flex flex-col justify-between"
+                      className="bg-slate-800/60 border border-slate-700/80 hover:border-indigo-500 rounded-2xl p-5 space-y-4 transition shadow-sm hover:shadow-md flex flex-col justify-between"
                     >
-                      <div>
+                      <div onClick={() => openFolderDetails(evt.id)} className="cursor-pointer">
                         <div className="flex justify-between items-center mb-2">
                           <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">
                             {evt.department}
@@ -385,7 +537,7 @@ export default function AdminDashboard({ user }) {
                         )}
                       </div>
 
-                      <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/80 space-y-1.5 text-xs">
+                      <div onClick={() => openFolderDetails(evt.id)} className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/80 space-y-1.5 text-xs cursor-pointer">
                         <div className="flex justify-between">
                           <span className="text-slate-400">Budget Cap:</span>
                           <span className="font-bold text-slate-200">₹{evt.budgetCap?.toLocaleString('en-IN')}</span>
@@ -407,8 +559,15 @@ export default function AdminDashboard({ user }) {
                       </div>
 
                       <div className="pt-2 border-t border-slate-700/60 flex justify-between items-center text-xs">
-                        <span className="text-slate-400 text-[11px]">Lifecycle: <strong>{evt.status}</strong></span>
-                        <span className="text-indigo-400 font-bold hover:underline">Open Folder →</span>
+                        <button
+                          onClick={() => generateSubEventPdf(evt)}
+                          className="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[10px] font-bold transition shadow-sm"
+                        >
+                          📥 Download PDF
+                        </button>
+                        <span onClick={() => openFolderDetails(evt.id)} className="text-indigo-400 font-bold hover:underline cursor-pointer">
+                          Open Folder →
+                        </span>
                       </div>
                     </div>
                   );
@@ -554,7 +713,7 @@ export default function AdminDashboard({ user }) {
           </section>
         )}
 
-        {/* ─── MODAL 1: SUB-EVENT FOLDER INSPECTOR (SHOWS ASSIGNED FACULTY & DETAILS) ─── */}
+        {/* ─── MODAL 1: SUB-EVENT FOLDER INSPECTOR ─── */}
         {selectedFolder && (
           <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto">
@@ -568,15 +727,23 @@ export default function AdminDashboard({ user }) {
                     </span>
                   </div>
                   <p className="text-xs text-slate-400 mt-1">
-                    Fest: <strong>{selectedFolder.festName}</strong> • Lifecycle Status: <strong className="text-emerald-400">{selectedFolder.status}</strong>
+                    Lifecycle Status: <strong className="text-emerald-400">{selectedFolder.status}</strong>
                   </p>
                 </div>
-                <button
-                  onClick={() => setSelectedFolder(null)}
-                  className="text-slate-400 hover:text-white text-2xl font-bold px-2"
-                >
-                  ✕
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => generateSubEventPdf(selectedFolder)}
+                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow"
+                  >
+                    📥 Download Folder PDF
+                  </button>
+                  <button
+                    onClick={() => setSelectedFolder(null)}
+                    className="text-slate-400 hover:text-white text-2xl font-bold px-2"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
 
               {/* Sub-Event Ledger Details */}
@@ -696,7 +863,7 @@ export default function AdminDashboard({ user }) {
           </div>
         )}
 
-        {/* ─── MODAL 2: PRINCIPAL SANCTION & AUDIT REMARK MODAL ─── */}
+        {/* ─── MODAL 2: PRINCIPAL / STOREKEEPER SANCTION MODAL ─── */}
         {selectedBill && !showRejectModal && (
           <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div className="bg-slate-900 border border-slate-700 w-full max-w-xl rounded-2xl shadow-2xl p-6 space-y-4">
@@ -779,7 +946,7 @@ export default function AdminDashboard({ user }) {
           </div>
         )}
 
-        {/* ─── MODAL 3: REJECTION MODAL ─── */}
+        {/* ─── MODAL 3: MANDATORY REJECTION FEEDBACK MODAL ─── */}
         {showRejectModal && (
           <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div className="bg-slate-900 border border-slate-700 w-full max-w-md rounded-2xl shadow-2xl p-6 space-y-4">
@@ -787,7 +954,7 @@ export default function AdminDashboard({ user }) {
               <p className="text-xs text-slate-400">Specify why Bill #{selectedBill?.billNo} is being kicked back to the Coordinator.</p>
 
               <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">Reason:</label>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">Reason for Rejection:</label>
                 <select
                   value={rejectionReason}
                   onChange={(e) => setRejectionReason(e.target.value)}
@@ -800,8 +967,24 @@ export default function AdminDashboard({ user }) {
                 </select>
               </div>
 
+              <div>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">
+                  Additional Remark (Optional):
+                </label>
+                <textarea
+                  rows={2}
+                  value={auditRemark}
+                  onChange={(e) => setAuditRemark(e.target.value)}
+                  placeholder="Add specific notes for correction..."
+                  className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 outline-none"
+                />
+              </div>
+
               <div className="flex justify-end gap-3 pt-2">
-                <button onClick={() => setShowRejectModal(false)} className="px-4 py-2 border border-slate-700 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800">
+                <button
+                  onClick={() => setShowRejectModal(false)}
+                  className="px-4 py-2 border border-slate-700 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800"
+                >
                   Back
                 </button>
                 <button

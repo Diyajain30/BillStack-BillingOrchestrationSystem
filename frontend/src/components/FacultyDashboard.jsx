@@ -107,8 +107,9 @@ export default function FacultyDashboard({ user }) {
   const pendingCount = scopedBills.filter((b) => b.status === 'PENDING_FACULTY').length;
   const approvedCount = scopedBills.filter(
     (b) =>
-      b.status === 'PENDING_STOREKEEPER' ||
+      b.status === 'PENDING_MAIN_HEAD' ||
       b.status === 'PENDING_PRINCIPAL' ||
+      b.status === 'PENDING_STOREKEEPER' ||
       b.status === 'APPROVED'
   ).length;
   const rejectedCount = scopedBills.filter((b) => b.status === 'REJECTED').length;
@@ -118,6 +119,7 @@ export default function FacultyDashboard({ user }) {
     if (activeTab === 'Pending Approvals') return b.status === 'PENDING_FACULTY';
     if (activeTab === 'Approved Bills') {
       return (
+        b.status === 'PENDING_MAIN_HEAD' ||
         b.status === 'PENDING_PRINCIPAL' ||
         b.status === 'PENDING_STOREKEEPER' ||
         b.status === 'APPROVED'
@@ -148,14 +150,14 @@ export default function FacultyDashboard({ user }) {
     setRejectionReason("Amount doesn't match the bill");
   };
 
-  // Approve bill and advance conveyor belt
+  // Approve bill and advance conveyor belt to PENDING_MAIN_HEAD
   const handleApprove = async () => {
     if (!selectedBill) return;
     setActionLoading(true);
 
     try {
       const payload = {
-        status: 'PENDING_PRINCIPAL',
+        status: 'APPROVED', // Will automatically transition PENDING_FACULTY -> PENDING_MAIN_HEAD in updated backend
         remark: facultyRemark || 'Verified and approved by Faculty Advisor',
         vendorName: editVendorName,
         billNo: editBillNo,
@@ -168,7 +170,7 @@ export default function FacultyDashboard({ user }) {
       };
 
       await backendApi.put(`/bills/${selectedBill.id}/status`, payload);
-      alert(`Bill #${editBillNo || selectedBill.billNo} approved and forwarded to Principal!`);
+      alert(`Bill #${editBillNo || selectedBill.billNo} approved and forwarded to Main Event Head!`);
       closeModals();
       fetchBills();
       fetchSubEventData();
@@ -180,7 +182,7 @@ export default function FacultyDashboard({ user }) {
     }
   };
 
-  // Reject bill and kick back to student coordinator
+  // Reject bill and kick back to student coordinator with reason and role
   const handleConfirmReject = async () => {
     if (!selectedBill) return;
     setActionLoading(true);
@@ -188,8 +190,9 @@ export default function FacultyDashboard({ user }) {
     try {
       await backendApi.put(`/bills/${selectedBill.id}/status`, {
         status: 'REJECTED',
-        remark: facultyRemark,
+        remark: facultyRemark || 'Rejected by Faculty Advisor',
         rejectionReason: rejectionReason,
+        rejectedBy: 'FACULTY',
       });
       alert(`Bill #${selectedBill.billNo} rejected and returned to Coordinator for corrections.`);
       closeModals();
@@ -360,7 +363,7 @@ export default function FacultyDashboard({ user }) {
           </div>
         </section>
 
-        {/* SECTION 2: 3 Operational Queue Cards (from original dashboard) */}
+        {/* SECTION 2: 3 Operational Queue Cards */}
         <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="bg-white p-5 rounded-2xl border border-violet-100 shadow-sm">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Pending Review</p>
@@ -370,7 +373,7 @@ export default function FacultyDashboard({ user }) {
           <div className="bg-white p-5 rounded-2xl border border-violet-100 shadow-sm">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Approved Forwarded</p>
             <p className="text-3xl font-extrabold text-emerald-600 mt-1">{approvedCount}</p>
-            <p className="text-xs text-slate-400 mt-1">Moved to Storekeeper / Principal</p>
+            <p className="text-xs text-slate-400 mt-1">Moved downstream in pipeline</p>
           </div>
           <div className="bg-white p-5 rounded-2xl border border-violet-100 shadow-sm">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Rejected (Feedback)</p>
@@ -604,7 +607,7 @@ export default function FacultyDashboard({ user }) {
           </div>
         )}
 
-        {/* ─── MANDATORY REJECTION MODAL ─── */}
+        {/* ─── MANDATORY REJECTION MODAL WITH REASON DROPDOWN ─── */}
         {showRejectModal && (
           <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl p-6 space-y-4">
@@ -620,7 +623,7 @@ export default function FacultyDashboard({ user }) {
                 <select
                   value={rejectionReason}
                   onChange={(e) => setRejectionReason(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs text-slate-800"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs text-slate-800 font-medium bg-white"
                 >
                   <option value="Amount doesn't match the bill">Amount doesn't match the bill</option>
                   <option value="Missing or unreadable receipt image">
@@ -633,6 +636,19 @@ export default function FacultyDashboard({ user }) {
                     Sub-event budget allocation exceeded
                   </option>
                 </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                  Additional Remark (Optional):
+                </label>
+                <textarea
+                  rows={2}
+                  value={facultyRemark}
+                  onChange={(e) => setFacultyRemark(e.target.value)}
+                  placeholder="Add specific notes for the student..."
+                  className="w-full p-2.5 border border-slate-300 rounded-lg text-xs"
+                />
               </div>
 
               <div className="flex justify-end gap-3 pt-2">

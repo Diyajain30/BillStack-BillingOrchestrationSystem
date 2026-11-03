@@ -4,6 +4,9 @@ import StudentDashboard from '../components/StudentDashboard';
 import FacultyDashboard from '../components/FacultyDashboard';
 import AdminDashboard from '../components/AdminDashboard';
 import StudentHeadDashboard from '../components/StudentHeadDashboard';
+import MainEventHeadDashboard from '../components/MainEventHeadDashboard';
+import PrincipalDashboard from '../components/PrincipalDashboard';
+import AccountsDashboard from '../components/AccountsDashboard';
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -31,6 +34,8 @@ export default function Dashboard() {
   const role = (user.role || '').toUpperCase();
 
   switch (role) {
+    case 'MAIN_EVENT_HEAD':
+      return <MainEventHeadDashboard user={user} />;
     case 'STUDENT_HEAD':
       return <StudentHeadDashboard user={user} />;
 
@@ -44,11 +49,15 @@ export default function Dashboard() {
       return <FacultyDashboard user={user} />;
 
     case 'PRINCIPAL':
+      return <PrincipalDashboard user={user} />;
     case 'ADMIN':
     case 'STOREKEEPER':
     case 'STORE':
-    case 'ACCOUNTS':
+    
       return <AdminDashboard user={user} />;
+
+     case 'ACCOUNTS':
+      return <AccountsDashboard user={user} />;
 
     default:
       return (

@@ -9,6 +9,7 @@ public class Bill {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "bill_id")
     private Long id;
 
     private String vendorName;
@@ -20,7 +21,9 @@ public class Bill {
     private Double cgst = 0.0;
     private Double sgst = 0.0;
     private String eventName;
-    private Long subEventId; // Sub-event folder isolation key
+    private Long subEventId;
+    private String rejectionReason;
+    private String rejectedBy;
 
     @Column(columnDefinition = "TEXT")
     private String description;
@@ -29,6 +32,12 @@ public class Bill {
     private Double runningTotal = 0.0;
 
     private LocalDateTime createdAt;
+
+    public String getRejectionReason() { return rejectionReason; }
+    public void setRejectionReason(String rejectionReason) { this.rejectionReason = rejectionReason; }
+
+    public String getRejectedBy() { return rejectedBy; }
+    public void setRejectedBy(String rejectedBy) { this.rejectedBy = rejectedBy; }
 
     @PrePersist
     protected void onCreate() {

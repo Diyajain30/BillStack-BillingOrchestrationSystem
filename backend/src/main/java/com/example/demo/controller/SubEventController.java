@@ -1,17 +1,16 @@
 package com.example.demo.controller;
 
+import java.util.*;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 import com.example.demo.entity.SubEvent;
 import com.example.demo.entity.User;
 import com.example.demo.repository.SubEventRepository;
 import com.example.demo.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.*;
 
 @RestController
-@RequestMapping("/api/subevents")
+@RequestMapping({"/api/subevents", "/api/events"})
 @CrossOrigin(origins = "http://localhost:3000")
 public class SubEventController {
 
@@ -36,10 +35,15 @@ public class SubEventController {
 
         SubEvent subEvent = subEventOpt.get();
         List<User> facultyHeads = userRepository.findAll().stream()
-                .filter(u -> "FACULTY".equalsIgnoreCase(u.getRole()) && id.equals(u.getAssignedSubEventId()))
+                .filter(u -> u.getRole() != null && 
+                        (u.getRole().toUpperCase().contains("FACULTY") || u.getRole().toUpperCase().contains("TEACHER")) && 
+                        id.equals(u.getAssignedSubEventId()))
                 .toList();
+                
         List<User> coordinators = userRepository.findAll().stream()
-                .filter(u -> "STUDENT_COORDINATOR".equalsIgnoreCase(u.getRole()) && id.equals(u.getAssignedSubEventId()))
+                .filter(u -> u.getRole() != null && 
+                        (u.getRole().toUpperCase().contains("STUDENT") || u.getRole().toUpperCase().contains("COORDINATOR")) && 
+                        id.equals(u.getAssignedSubEventId()))
                 .toList();
 
         Map<String, Object> res = new HashMap<>();
@@ -52,40 +56,80 @@ public class SubEventController {
         res.put("advanceDisbursed", subEvent.getAdvanceDisbursed());
         res.put("totalSpent", subEvent.getTotalSpent());
         res.put("status", subEvent.getStatus());
+        res.put("wingName", subEvent.getWingName());
+        res.put("parentEventId", subEvent.getParentEventId());
+        res.put("mainHeadId", subEvent.getMainHeadId());
+        res.put("closureRequested", subEvent.getClosureRequested());
+        res.put("facultyClosureApproved", subEvent.getFacultyClosureApproved());
+        res.put("studentHeadClosureApproved", subEvent.getStudentHeadClosureApproved());
+        res.put("principalClosureSanctioned", subEvent.getPrincipalClosureSanctioned());
+        res.put("storekeeperClosureVerified", subEvent.getStorekeeperClosureVerified());
         res.put("facultyHeads", facultyHeads);
         res.put("coordinators", coordinators);
 
         return ResponseEntity.ok(res);
     }
 
-    // POST /api/subevents - Create Sub-Event
+    // POST /api/subevents - Create Sub-Event or Master Event (Wing)
     @PostMapping
     public ResponseEntity<?> createSubEvent(@RequestBody Map<String, Object> payload) {
-        String name = (String) payload.get("name");
+        String name = (String) payload.getOrDefault("name", payload.get("subEventName"));
         String department = (String) payload.get("department");
-        String description = (String) payload.get("description");
-        Double budgetCap = Double.valueOf(payload.get("budgetCap").toString());
+        String description = (String) payload.getOrDefault("description", "");
+        
+        Double budgetCap = payload.get("budgetCap") != null 
+                ? Double.valueOf(payload.get("budgetCap").toString()) 
+                : (payload.get("allocatedBudget") != null ? Double.valueOf(payload.get("allocatedBudget").toString()) : 0.0);
+        
         Double advanceDisbursed = payload.get("advanceDisbursed") != null 
                 ? Double.valueOf(payload.get("advanceDisbursed").toString()) 
                 : 0.0;
 
+        String wingName = (String) payload.get("wingName");
+        Long parentEventId = payload.get("parentEventId") != null ? Long.valueOf(payload.get("parentEventId").toString()) : null;
+        Long mainHeadId = payload.get("mainHeadId") != null ? Long.valueOf(payload.get("mainHeadId").toString()) : null;
+
         SubEvent subEvent = new SubEvent(name, department, description, budgetCap, advanceDisbursed);
+        subEvent.setWingName(wingName);
+        subEvent.setParentEventId(parentEventId);
+        subEvent.setMainHeadId(mainHeadId);
+
         SubEvent savedEvent = subEventRepository.save(subEvent);
 
-        if (payload.get("coordinatorIds") instanceof List<?> coordIds) {
-            for (Object idObj : coordIds) {
-                Long userId = Long.valueOf(idObj.toString());
-                userRepository.findById(userId).ifPresent(u -> {
+        // Universal Coordinator ID Extraction (Supports List or Single ID / String or Number)
+        Object coordPayload = payload.containsKey("coordinatorIds") ? payload.get("coordinatorIds") : payload.get("studentCoordinatorId");
+        if (coordPayload != null) {
+            List<Long> coordIds = new ArrayList<>();
+            if (coordPayload instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item != null && !item.toString().isBlank()) coordIds.add(Long.valueOf(item.toString()));
+                }
+            } else if (!coordPayload.toString().isBlank()) {
+                coordIds.add(Long.valueOf(coordPayload.toString()));
+            }
+
+            for (Long cId : coordIds) {
+                userRepository.findById(cId).ifPresent(u -> {
                     u.setAssignedSubEventId(savedEvent.getId());
                     userRepository.save(u);
                 });
             }
         }
 
-        if (payload.get("facultyIds") instanceof List<?> facIds) {
-            for (Object idObj : facIds) {
-                Long userId = Long.valueOf(idObj.toString());
-                userRepository.findById(userId).ifPresent(u -> {
+        // Universal Faculty ID Extraction (Supports List or Single ID / String or Number)
+        Object facPayload = payload.containsKey("facultyIds") ? payload.get("facultyIds") : payload.get("facultyHeadId");
+        if (facPayload != null) {
+            List<Long> facIds = new ArrayList<>();
+            if (facPayload instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item != null && !item.toString().isBlank()) facIds.add(Long.valueOf(item.toString()));
+                }
+            } else if (!facPayload.toString().isBlank()) {
+                facIds.add(Long.valueOf(facPayload.toString()));
+            }
+
+            for (Long fId : facIds) {
+                userRepository.findById(fId).ifPresent(u -> {
                     u.setAssignedSubEventId(savedEvent.getId());
                     userRepository.save(u);
                 });
@@ -105,18 +149,50 @@ public class SubEventController {
 
         SubEvent subEvent = subEventOpt.get();
         if (payload.containsKey("name")) subEvent.setName((String) payload.get("name"));
+        else if (payload.containsKey("subEventName")) subEvent.setName((String) payload.get("subEventName"));
+        
         if (payload.containsKey("department")) subEvent.setDepartment((String) payload.get("department"));
         if (payload.containsKey("description")) subEvent.setDescription((String) payload.get("description"));
-        if (payload.containsKey("budgetCap")) subEvent.setBudgetCap(Double.valueOf(payload.get("budgetCap").toString()));
-        if (payload.containsKey("advanceDisbursed")) subEvent.setAdvanceDisbursed(Double.valueOf(payload.get("advanceDisbursed").toString()));
+        
+        if (payload.containsKey("budgetCap") && payload.get("budgetCap") != null) {
+            subEvent.setBudgetCap(Double.valueOf(payload.get("budgetCap").toString()));
+        } else if (payload.containsKey("allocatedBudget") && payload.get("allocatedBudget") != null) {
+            subEvent.setBudgetCap(Double.valueOf(payload.get("allocatedBudget").toString()));
+        }
+        
+        if (payload.containsKey("advanceDisbursed") && payload.get("advanceDisbursed") != null) {
+            subEvent.setAdvanceDisbursed(Double.valueOf(payload.get("advanceDisbursed").toString()));
+        }
+        if (payload.containsKey("wingName")) subEvent.setWingName((String) payload.get("wingName"));
+        if (payload.containsKey("status")) subEvent.setStatus((String) payload.get("status"));
+        
+        if (payload.containsKey("parentEventId")) {
+            Object pId = payload.get("parentEventId");
+            subEvent.setParentEventId(pId != null && !pId.toString().isBlank() ? Long.valueOf(pId.toString()) : null);
+        }
+        if (payload.containsKey("mainHeadId")) {
+            Object mId = payload.get("mainHeadId");
+            subEvent.setMainHeadId(mId != null && !mId.toString().isBlank() ? Long.valueOf(mId.toString()) : null);
+        }
 
         SubEvent updatedEvent = subEventRepository.save(subEvent);
 
-        // Sync Student Coordinators
-        if (payload.containsKey("coordinatorIds")) {
-            List<?> coordIds = (List<?>) payload.get("coordinatorIds");
+        // Sync Student Coordinators Universally
+        Object coordPayload = payload.containsKey("coordinatorIds") ? payload.get("coordinatorIds") : payload.get("studentCoordinatorId");
+        if (coordPayload != null) {
+            List<Long> coordIds = new ArrayList<>();
+            if (coordPayload instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item != null && !item.toString().isBlank()) coordIds.add(Long.valueOf(item.toString()));
+                }
+            } else if (!coordPayload.toString().isBlank()) {
+                coordIds.add(Long.valueOf(coordPayload.toString()));
+            }
+
             List<User> existingCoords = userRepository.findAll().stream()
-                    .filter(u -> "STUDENT_COORDINATOR".equalsIgnoreCase(u.getRole()) && id.equals(u.getAssignedSubEventId()))
+                    .filter(u -> u.getRole() != null && 
+                            (u.getRole().toUpperCase().contains("STUDENT") || u.getRole().toUpperCase().contains("COORDINATOR")) && 
+                            id.equals(u.getAssignedSubEventId()))
                     .toList();
 
             for (User u : existingCoords) {
@@ -125,20 +201,30 @@ public class SubEventController {
                     userRepository.save(u);
                 }
             }
-            for (Object cId : coordIds) {
-                Long uId = Long.valueOf(cId.toString());
-                userRepository.findById(uId).ifPresent(u -> {
+            for (Long cId : coordIds) {
+                userRepository.findById(cId).ifPresent(u -> {
                     u.setAssignedSubEventId(updatedEvent.getId());
                     userRepository.save(u);
                 });
             }
         }
 
-        // Sync Faculty Heads
-        if (payload.containsKey("facultyIds")) {
-            List<?> facIds = (List<?>) payload.get("facultyIds");
+        // Sync Faculty Heads Universally
+        Object facPayload = payload.containsKey("facultyIds") ? payload.get("facultyIds") : payload.get("facultyHeadId");
+        if (facPayload != null) {
+            List<Long> facIds = new ArrayList<>();
+            if (facPayload instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item != null && !item.toString().isBlank()) facIds.add(Long.valueOf(item.toString()));
+                }
+            } else if (!facPayload.toString().isBlank()) {
+                facIds.add(Long.valueOf(facPayload.toString()));
+            }
+
             List<User> existingFac = userRepository.findAll().stream()
-                    .filter(u -> "FACULTY".equalsIgnoreCase(u.getRole()) && id.equals(u.getAssignedSubEventId()))
+                    .filter(u -> u.getRole() != null && 
+                            (u.getRole().toUpperCase().contains("FACULTY") || u.getRole().toUpperCase().contains("TEACHER")) && 
+                            id.equals(u.getAssignedSubEventId()))
                     .toList();
 
             for (User u : existingFac) {
@@ -147,9 +233,8 @@ public class SubEventController {
                     userRepository.save(u);
                 }
             }
-            for (Object fId : facIds) {
-                Long uId = Long.valueOf(fId.toString());
-                userRepository.findById(uId).ifPresent(u -> {
+            for (Long fId : facIds) {
+                userRepository.findById(fId).ifPresent(u -> {
                     u.setAssignedSubEventId(updatedEvent.getId());
                     userRepository.save(u);
                 });
@@ -177,34 +262,106 @@ public class SubEventController {
         return ResponseEntity.ok(subEventRepository.save(subEvent));
     }
 
-    // GET /api/subevents/unassigned-users - For creation dropdowns
+    // --- Macro Lifecycle: File Closure & Disbursement Pipeline ---
+
+    @PostMapping("/{id}/request-closure")
+    public ResponseEntity<?> requestClosure(@PathVariable Long id) {
+        return subEventRepository.findById(id).map(subEvent -> {
+            subEvent.setClosureRequested(true);
+            subEvent.setStatus("CLOSURE_PENDING");
+            SubEvent updated = subEventRepository.save(subEvent);
+            return ResponseEntity.ok(updated);
+        }).orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}/verify-closure")
+    public ResponseEntity<?> verifyClosure(@PathVariable Long id, @RequestBody Map<String, String> payload) {
+        String role = payload.get("role"); // "FACULTY" or "STUDENT_HEAD"
+        
+        return subEventRepository.findById(id).map(subEvent -> {
+            if (role != null && role.toUpperCase().contains("FACULTY")) {
+                subEvent.setFacultyClosureApproved(true);
+            } else if (role != null && role.toUpperCase().contains("STUDENT_HEAD")) {
+                subEvent.setStudentHeadClosureApproved(true);
+            }
+
+            if (Boolean.TRUE.equals(subEvent.getFacultyClosureApproved()) && 
+                Boolean.TRUE.equals(subEvent.getStudentHeadClosureApproved())) {
+                subEvent.setStatus("CLOSED");
+            }
+
+            SubEvent updated = subEventRepository.save(subEvent);
+            return ResponseEntity.ok(updated);
+        }).orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}/sanction-closure")
+    public ResponseEntity<?> sanctionClosure(@PathVariable Long id, @RequestBody Map<String, String> payload) {
+        String role = payload.get("role"); // "PRINCIPAL" or "STOREKEEPER"
+
+        return subEventRepository.findById(id).map(subEvent -> {
+            if (role != null && role.toUpperCase().contains("PRINCIPAL")) {
+                subEvent.setPrincipalClosureSanctioned(true);
+            } else if (role != null && role.toUpperCase().contains("STOREKEEPER")) {
+                subEvent.setStorekeeperClosureVerified(true);
+            }
+
+            SubEvent updated = subEventRepository.save(subEvent);
+            return ResponseEntity.ok(updated);
+        }).orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/{id}/disburse")
+    public ResponseEntity<?> disburseSubEvent(@PathVariable Long id) {
+        return subEventRepository.findById(id).map(subEvent -> {
+            double totalSpent = subEvent.getTotalSpent() != null ? subEvent.getTotalSpent() : 0.0;
+            double advanceDisbursed = subEvent.getAdvanceDisbursed() != null ? subEvent.getAdvanceDisbursed() : 0.0;
+            double netSettlement = totalSpent - advanceDisbursed;
+
+            subEvent.setStatus("DISBURSED");
+            SubEvent updated = subEventRepository.save(subEvent);
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("subEvent", updated);
+            response.put("netSettlement", netSettlement);
+            response.put("message", "Payout calculated and executed successfully.");
+
+            return ResponseEntity.ok(response);
+        }).orElse(ResponseEntity.notFound().build());
+    }
+
     @GetMapping("/unassigned-users")
-    public ResponseEntity<List<User>> getUnassignedUsers(@RequestParam String role, @RequestParam String department) {
+    public ResponseEntity<List<User>> getUnassignedUsers(@RequestParam String role, @RequestParam(required = false) String department) {
         List<User> users = userRepository.findAll().stream()
-                .filter(u -> u.getRole().equalsIgnoreCase(role))
-                .filter(u -> department == null || department.isEmpty() || u.getDepartment().equalsIgnoreCase(department))
+                .filter(u -> u.getRole() != null && u.getRole().toUpperCase().contains(role.toUpperCase()))
+                .filter(u -> department == null || department.isEmpty() || (u.getDepartment() != null && u.getDepartment().equalsIgnoreCase(department)))
                 .filter(u -> u.getAssignedSubEventId() == null)
                 .toList();
         return ResponseEntity.ok(users);
     }
 
-    // GET /api/subevents/{id}/candidates - For editing dropdowns (current assignees + available unassigned)
     @GetMapping("/{id}/candidates")
     public ResponseEntity<Map<String, List<User>>> getCandidates(
             @PathVariable Long id, 
             @RequestParam(required = false) String department) {
         List<User> users = userRepository.findAll();
         List<User> coords = users.stream()
-                .filter(u -> "STUDENT_COORDINATOR".equalsIgnoreCase(u.getRole()))
-                .filter(u -> department == null || department.isEmpty() || department.equalsIgnoreCase(u.getDepartment()))
+                .filter(u -> u.getRole() != null && 
+                        (u.getRole().toUpperCase().contains("STUDENT") || u.getRole().toUpperCase().contains("COORDINATOR")))
+                .filter(u -> department == null || department.isEmpty() || (u.getDepartment() != null && department.equalsIgnoreCase(u.getDepartment())))
                 .filter(u -> u.getAssignedSubEventId() == null || id.equals(u.getAssignedSubEventId()))
                 .toList();
         List<User> faculty = users.stream()
-                .filter(u -> "FACULTY".equalsIgnoreCase(u.getRole()))
-                .filter(u -> department == null || department.isEmpty() || department.equalsIgnoreCase(u.getDepartment()))
+                .filter(u -> u.getRole() != null && 
+                        (u.getRole().toUpperCase().contains("FACULTY") || u.getRole().toUpperCase().contains("TEACHER")))
+                .filter(u -> department == null || department.isEmpty() || (u.getDepartment() != null && department.equalsIgnoreCase(u.getDepartment())))
                 .filter(u -> u.getAssignedSubEventId() == null || id.equals(u.getAssignedSubEventId()))
                 .toList();
 
-        return ResponseEntity.ok(Map.of("coordinators", coords, "faculty", faculty));
+        Map<String, List<User>> responseMap = new HashMap<>();
+        responseMap.put("coordinators", coords);
+        responseMap.put("faculty", faculty);
+
+        return ResponseEntity.ok(responseMap);
     }
 }

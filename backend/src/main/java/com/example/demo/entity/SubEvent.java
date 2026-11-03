@@ -3,32 +3,40 @@ package com.example.demo.entity;
 import jakarta.persistence.*;
 
 @Entity
-@Table(name = "sub_events")
+@Table(name = "events")
 public class SubEvent {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "event_id")
     private Long id;
 
-    @Column(nullable = false, unique = true)
+    @Column(nullable = false)
     private String name;
 
     private String festName = "Wings Technical Fest";
 
-    @Column(nullable = false)
     private String department;
 
     @Column(columnDefinition = "TEXT")
     private String description;
 
     @Column(nullable = false)
-    private Double budgetCap; // Dynamic input, not hardcoded
+    private Double budgetCap;
 
-    private Double advanceDisbursed = 0.0; // Updated anytime by Student Head
+    private Double advanceDisbursed = 0.0;
 
     private Double totalSpent = 0.0;
 
-    // Sub-event File Closure & Settlement Flags
+    @Column(name = "wing_name")
+    private String wingName;
+
+    @Column(name = "parent_event_id")
+    private Long parentEventId;
+
+    @Column(name = "main_head_id")
+    private Long mainHeadId;
+
     private Boolean closureRequested = false;
     private Boolean facultyClosureApproved = false;
     private Boolean studentHeadClosureApproved = false;
@@ -36,7 +44,7 @@ public class SubEvent {
     private Boolean storekeeperClosureVerified = false;
 
     @Column(nullable = false)
-    private String status = "OPEN"; // OPEN, CLOSURE_PENDING, CLOSED, DISBURSED
+    private String status = "OPEN";
 
     public SubEvent() {}
 
@@ -73,6 +81,15 @@ public class SubEvent {
 
     public Double getTotalSpent() { return totalSpent; }
     public void setTotalSpent(Double totalSpent) { this.totalSpent = totalSpent; }
+
+    public String getWingName() { return wingName; }
+    public void setWingName(String wingName) { this.wingName = wingName; }
+
+    public Long getParentEventId() { return parentEventId; }
+    public void setParentEventId(Long parentEventId) { this.parentEventId = parentEventId; }
+
+    public Long getMainHeadId() { return mainHeadId; }
+    public void setMainHeadId(Long mainHeadId) { this.mainHeadId = mainHeadId; }
 
     public Boolean getClosureRequested() { return closureRequested; }
     public void setClosureRequested(Boolean closureRequested) { this.closureRequested = closureRequested; }

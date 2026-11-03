@@ -67,22 +67,12 @@ public class BillController {
         Bill saved = billRepository.save(bill);
 
         // Update SubEvent totalSpent
-        if (saved.getSubEventId() != null) {
-            subEventRepository.findById(saved.getSubEventId()).ifPresent(se -> {
-                double spent = billRepository.findAll().stream()
-                        .filter(b -> saved.getSubEventId().equals(b.getSubEventId()))
-                        .filter(b -> !"REJECTED".equalsIgnoreCase(b.getStatus()))
-                        .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
-                        .sum();
-                se.setTotalSpent(spent);
-                subEventRepository.save(se);
-            });
-        }
+        updateSubEventSpending(saved.getSubEventId());
 
         return ResponseEntity.status(HttpStatus.CREATED).body(saved);
     }
 
-    // PUT /api/bills/{id}/status - Update bill status and audit note
+    // PUT /api/bills/{id}/status - Update bill status through approval pipeline or handle rejections
     @PutMapping("/{id}/status")
     public ResponseEntity<?> updateBillStatus(@PathVariable Long id, @RequestBody Map<String, Object> payload) {
         Optional<Bill> billOpt = billRepository.findById(id);
@@ -93,8 +83,35 @@ public class BillController {
         Bill bill = billOpt.get();
 
         if (payload.containsKey("status")) {
-            bill.setStatus((String) payload.get("status"));
+            String targetStatus = (String) payload.get("status");
+
+            if ("REJECTED".equalsIgnoreCase(targetStatus)) {
+                bill.setStatus("REJECTED");
+                if (payload.containsKey("rejectionReason")) {
+                    bill.setRejectionReason((String) payload.get("rejectionReason"));
+                }
+                if (payload.containsKey("rejectedBy")) {
+                    bill.setRejectedBy((String) payload.get("rejectedBy"));
+                }
+            } else if ("APPROVED".equalsIgnoreCase(targetStatus)) {
+                String currentStatus = bill.getStatus();
+                if ("PENDING_FACULTY".equalsIgnoreCase(currentStatus)) {
+                    bill.setStatus("PENDING_MAIN_HEAD");
+                } else if ("PENDING_MAIN_HEAD".equalsIgnoreCase(currentStatus)) {
+                    bill.setStatus("PENDING_PRINCIPAL");
+                } else if ("PENDING_PRINCIPAL".equalsIgnoreCase(currentStatus)) {
+                    bill.setStatus("PENDING_STOREKEEPER");
+                } else if ("PENDING_STOREKEEPER".equalsIgnoreCase(currentStatus)) {
+                    bill.setStatus("APPROVED");
+                } else {
+                    bill.setStatus("APPROVED");
+                }
+            } else {
+                bill.setStatus(targetStatus);
+            }
         }
+
+        // Editable fields sync (supports manual OCR overrides during review gates)
         if (payload.containsKey("vendorName")) bill.setVendorName((String) payload.get("vendorName"));
         if (payload.containsKey("billNo")) bill.setBillNo((String) payload.get("billNo"));
         if (payload.containsKey("billDate")) bill.setBillDate((String) payload.get("billDate"));
@@ -113,10 +130,45 @@ public class BillController {
         Bill updated = billRepository.save(bill);
 
         // Recalculate SubEvent totalSpent
-        if (updated.getSubEventId() != null) {
-            subEventRepository.findById(updated.getSubEventId()).ifPresent(se -> {
+        updateSubEventSpending(updated.getSubEventId());
+
+        return ResponseEntity.ok(updated);
+    }
+
+    // PUT /api/bills/{id}/reupload - Student re-uploads/corrects a rejected bill
+    @PutMapping("/{id}/reupload")
+    public ResponseEntity<?> reuploadBill(@PathVariable Long id, @RequestBody Bill updatedData) {
+        Optional<Bill> billOpt = billRepository.findById(id);
+        if (billOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Bill bill = billOpt.get();
+
+        // Update details with re-uploaded info
+        if (updatedData.getVendorName() != null) bill.setVendorName(updatedData.getVendorName());
+        if (updatedData.getBillNo() != null) bill.setBillNo(updatedData.getBillNo());
+        if (updatedData.getAmount() != null) bill.setAmount(updatedData.getAmount());
+        if (updatedData.getBillDate() != null) bill.setBillDate(updatedData.getBillDate());
+       // if (updatedData.getBillImageUrl() != null) bill.setBillImageUrl(updatedData.getBillImageUrl());
+
+        // Reset pipeline state back to Faculty review and clear rejection info
+        bill.setStatus("PENDING_FACULTY");
+        bill.setRejectionReason(null);
+        bill.setRejectedBy(null);
+
+        Bill saved = billRepository.save(bill);
+        updateSubEventSpending(saved.getSubEventId());
+
+        return ResponseEntity.ok(saved);
+    }
+
+    // Helper method to recalculate sub-event spending
+    private void updateSubEventSpending(Long subEventId) {
+        if (subEventId != null) {
+            subEventRepository.findById(subEventId).ifPresent(se -> {
                 double spent = billRepository.findAll().stream()
-                        .filter(b -> updated.getSubEventId().equals(b.getSubEventId()))
+                        .filter(b -> subEventId.equals(b.getSubEventId()))
                         .filter(b -> !"REJECTED".equalsIgnoreCase(b.getStatus()))
                         .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
                         .sum();
@@ -124,7 +176,5 @@ public class BillController {
                 subEventRepository.save(se);
             });
         }
-
-        return ResponseEntity.ok(updated);
     }
 }

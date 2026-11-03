@@ -40,6 +40,10 @@ export default function StudentDashboard({ user }) {
   const [bills, setBills] = useState([]);
   const [loadingBills, setLoadingBills] = useState(false);
 
+  // Re-upload Modal State for Rejected Bills
+  const [selectedRejectedBill, setSelectedRejectedBill] = useState(null);
+  const [isReuploadModalOpen, setIsReuploadModalOpen] = useState(false);
+
   // 1. Fetch sub-event profile for coordinator
   const fetchSubEventData = useCallback(async () => {
     try {
@@ -111,6 +115,9 @@ export default function StudentDashboard({ user }) {
       })
     : [];
 
+  // Separate rejected bills for immediate action
+  const rejectedBills = scopedBills.filter((b) => b.status === 'REJECTED');
+
   // 4. Real-time metrics calculated strictly from scopedBills
   const allocatedBudget = subEvent?.budgetCap ? Number(subEvent.budgetCap) : 0;
   const advancePayment = subEvent?.advanceDisbursed ? Number(subEvent.advanceDisbursed) : 0;
@@ -181,14 +188,22 @@ export default function StudentDashboard({ user }) {
       cgst: parseFloat(cgst) || 0,
       sgst: parseFloat(sgst) || 0,
       eventName: subEvent.name,
-      subEventId: subEvent.id, // Enforces folder isolation
+      subEventId: subEvent.id,
       description: description || `Submitted by Coordinator ${currentUser?.name || ''}`,
       status: 'PENDING_FACULTY',
     };
 
     try {
-      await backendApi.post('/bills', payload);
-      alert('Bill successfully submitted to the approval conveyor belt!');
+      if (selectedRejectedBill) {
+        await backendApi.put(`/bills/${selectedRejectedBill.id}`, payload);
+        alert('Corrected bill successfully re-submitted to the approval conveyor belt!');
+        setSelectedRejectedBill(null);
+        setIsReuploadModalOpen(false);
+      } else {
+        await backendApi.post('/bills', payload);
+        alert('Bill successfully submitted to the approval conveyor belt!');
+      }
+
       setSelectedFile(null);
       setFileObject(null);
       setFilePreview(null);
@@ -211,6 +226,20 @@ export default function StudentDashboard({ user }) {
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleOpenReuploadModal = (bill) => {
+    setSelectedRejectedBill(bill);
+    setVendorName(bill.vendorName || '');
+    setBillNo(bill.billNo || '');
+    setAmount(bill.amount || '');
+    setBaseAmount(bill.baseAmount || bill.amount || '');
+    setBillDate(bill.billDate || '');
+    setVendorGstin(bill.vendorGstin || '');
+    setCgst(bill.cgst || 0);
+    setSgst(bill.sgst || 0);
+    setDescription(bill.description || '');
+    setIsReuploadModalOpen(true);
   };
 
   // Duplex PDF Voucher Generator
@@ -389,6 +418,42 @@ export default function StudentDashboard({ user }) {
             </div>
           </div>
         </header>
+
+        {/* Action Required: Rejected Bills Section */}
+        {rejectedBills.length > 0 && (
+          <div className="bg-red-950/20 border border-red-500/20 rounded-2xl p-5 shadow-sm">
+            <h3 className="text-base font-black text-red-500 mb-3 flex items-center gap-2">
+              <span>⚠️</span> Action Required: Rejected Bills ({rejectedBills.length})
+            </h3>
+            <div className="grid gap-3">
+              {rejectedBills.map((bill) => (
+                <div key={bill.id} className="bg-white border border-red-200 rounded-xl p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-sm">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-slate-900 text-sm">{bill.vendorName}</span>
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-red-100 text-red-700 font-bold border border-red-200">
+                        Rejected by {bill.rejectedBy || 'Authority'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Invoice #{bill.billNo} | Amount: ₹{bill.amount}
+                    </p>
+                    <div className="mt-2 text-xs bg-red-50 text-red-800 p-2.5 rounded-lg border border-red-200 font-medium">
+                      <strong>Reason for Rejection:</strong> {bill.rejectionReason || bill.remark || "No remark provided."}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => handleOpenReuploadModal(bill)}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs rounded-xl transition shadow whitespace-nowrap"
+                  >
+                    ✏️ Fix & Re-upload
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* High Utilization Alert */}
         {isBudgetWarning && (
@@ -731,6 +796,86 @@ export default function StudentDashboard({ user }) {
           </section>
         )}
       </main>
+
+      {/* RE-UPLOAD MODAL FOR REJECTED BILLS */}
+      {isReuploadModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-slate-900">Fix & Re-upload Rejected Bill</h3>
+              <button onClick={() => setIsReuploadModalOpen(false)} className="text-slate-400 hover:text-slate-600 font-bold text-lg">✕</button>
+            </div>
+
+            <div className="bg-amber-50 p-3 rounded-xl border border-amber-200 text-xs text-amber-900">
+              <strong>Rejection Reason:</strong> {selectedRejectedBill?.rejectionReason || selectedRejectedBill?.remark || "Please correct the errors and re-submit."}
+            </div>
+
+            <form onSubmit={handleSubmitBill} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-bold text-slate-700 uppercase mb-1">Vendor Name</label>
+                <input
+                  type="text"
+                  value={vendorName}
+                  onChange={(e) => setVendorName(e.target.value)}
+                  className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
+                  required
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold text-slate-700 uppercase mb-1">Bill Number</label>
+                  <input
+                    type="text"
+                    value={billNo}
+                    onChange={(e) => setBillNo(e.target.value)}
+                    className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block font-bold text-slate-700 uppercase mb-1">Amount (₹)</label>
+                  <input
+                    type="number"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.print || e.target.value)}
+                    className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 uppercase mb-1">Correction Notes / Remarks</label>
+                <textarea
+                  rows={2}
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Explain corrections made..."
+                  className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
+                />
+              </div>
+
+              <div className="flex justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsReuploadModalOpen(false)}
+                  className="px-4 py-2 border border-slate-300 rounded-xl font-bold text-slate-600 hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="px-5 py-2 bg-violet-700 hover:bg-violet-800 text-white font-bold rounded-xl shadow transition"
+                >
+                  {isSubmitting ? 'Submitting...' : 'Submit Correction'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

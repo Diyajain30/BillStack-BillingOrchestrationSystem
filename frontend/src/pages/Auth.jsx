@@ -21,7 +21,8 @@ export default function Auth() {
 
   const roles = [
     { value: 'STUDENT_COORDINATOR', label: 'Student Coordinator' },
-    { value: 'STUDENT_HEAD', label: 'Student Head (Wings Fest)' },
+    { value: 'STUDENT_HEAD', label: 'Student Head Coordinator' },
+    { value: 'MAIN_EVENT_HEAD', label: 'Main Event Head' },
     { value: 'FACULTY', label: 'Faculty Head' },
     { value: 'PRINCIPAL', label: 'Principal' },
     { value: 'STOREKEEPER', label: 'Storekeeper' },
