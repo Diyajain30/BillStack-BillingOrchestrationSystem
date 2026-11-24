@@ -2,84 +2,132 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { jsPDF } from 'jspdf';
 import { backendApi, ocrApi } from '../services/api';
-import axios from 'axios';
+import AuditLogModal from './AuditLogModal';
+import { SubEventAnalytics } from './AnalyticsCharts';
 
-export default function StudentDashboard({ user }) {
+const APPROVAL_STAGES = [
+  { key: 'PENDING_FACULTY', label: 'Faculty' },
+  { key: 'PENDING_MAIN_HEAD', label: 'Main Head' },
+  { key: 'PENDING_PRINCIPAL', label: 'Principal' },
+  { key: 'PENDING_STOREKEEPER', label: 'Storekeeper' },
+];
+
+function getStageIndex(status) {
+  switch (status) {
+    case 'PENDING_FACULTY':
+      return 0;
+    case 'PENDING_MAIN_HEAD':
+      return 1;
+    case 'PENDING_PRINCIPAL':
+      return 2;
+    case 'PENDING_STOREKEEPER':
+      return 3;
+    case 'APPROVED':
+      return 4;
+    default:
+      return -1;
+  }
+}
+
+function getStatusBadgeClass(status) {
+  if (status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
+  if (status === 'REJECTED') {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  return 'bg-amber-50 text-amber-800 border-amber-200';
+}
+
+function fileToCompressedDataUrl(file) {
+  return new Promise((resolve) => {
+    if (!file) return resolve('');
+    if (file.type === 'application/pdf') {
+      const reader = new FileReader();
+      reader.onload = () =>
+        resolve(typeof reader.result === 'string' ? reader.result : '');
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 1200;
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const ratio = Math.min(maxDim / width, maxDim / height);
+          width = Math.round(width * ratio);
+          height = Math.round(height * ratio);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.78));
+      };
+      img.onerror = () =>
+        resolve(typeof ev.target?.result === 'string' ? ev.target.result : '');
+      img.src = ev.target?.result;
+    };
+    reader.onerror = () => resolve('');
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function StudentDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  // Navigation
-  const [activeTab, setActiveTab] = useState('Dashboard');
-  const sidebarItems = ['Dashboard', 'Upload Bill', 'My Bills', 'Budget Overview'];
-
-  // Current User & Assigned Sub-Event Context
+  const [activeTab, setActiveTab] = useState('summary'); // 'summary' | 'upload' | 'bills' | 'profile'
   const [currentUser, setCurrentUser] = useState(user);
   const [subEvent, setSubEvent] = useState(null);
+  const [coordinatorList, setCoordinatorList] = useState([]);
   const [facultyList, setFacultyList] = useState([]);
   const [loadingEvent, setLoadingEvent] = useState(true);
 
-  // File & OCR States
-  const [selectedFile, setSelectedFile] = useState(null);
-  const [fileObject, setFileObject] = useState(null);
-  const [filePreview, setFilePreview] = useState(null);
-  const [isScanning, setIsScanning] = useState(false);
-  const [ocrError, setOcrError] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  // Extracted Bill Details (Locked read-only for coordinators)
-  const [vendorName, setVendorName] = useState('');
-  const [billNo, setBillNo] = useState('');
-  const [amount, setAmount] = useState('');
-  const [baseAmount, setBaseAmount] = useState('');
-  const [billDate, setBillDate] = useState('');
-  const [vendorGstin, setVendorGstin] = useState('');
-  const [cgst, setCgst] = useState(0);
-  const [sgst, setSgst] = useState(0);
-  const [description, setDescription] = useState('');
-
-  // Bills State
   const [bills, setBills] = useState([]);
   const [loadingBills, setLoadingBills] = useState(false);
 
-  // Re-upload Modal State for Rejected Bills
+  // Upload & OCR state
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [receiptImage, setReceiptImage] = useState('');
+  const [isScanning, setIsScanning] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState({ type: '', text: '' });
+
+  const [vendorName, setVendorName] = useState('');
+  const [billNo, setBillNo] = useState('');
+  const [billDate, setBillDate] = useState('');
+  const [vendorGstin, setVendorGstin] = useState('');
+  const [baseAmount, setBaseAmount] = useState('');
+  const [cgst, setCgst] = useState('');
+  const [sgst, setSgst] = useState('');
+  const [amount, setAmount] = useState('');
+  const [remarks, setRemarks] = useState('');
+  const [reuploadRemark, setReuploadRemark] = useState('');
+
+  // Modals
   const [selectedRejectedBill, setSelectedRejectedBill] = useState(null);
-  const [isReuploadModalOpen, setIsReuploadModalOpen] = useState(false);
+  const [selectedBillForAudit, setSelectedBillForAudit] = useState(null);
 
-  // 1. Fetch sub-event profile for coordinator
-  const fetchSubEventData = useCallback(async () => {
-    try {
-      setLoadingEvent(true);
-      let subEventId = currentUser?.assignedSubEventId;
+  const showMessage = (type, text) => {
+    setFeedback({ type, text });
+    setTimeout(() => {
+      setFeedback((prev) => (prev.text === text ? { type: '', text: '' } : prev));
+    }, 5000);
+  };
 
-      if (!subEventId && currentUser?.id) {
-        const userRes = await axios.get(`http://localhost:8080/api/users/${currentUser.id}`);
-        if (userRes.data?.assignedSubEventId) {
-          subEventId = userRes.data.assignedSubEventId;
-          setCurrentUser(userRes.data);
-          localStorage.setItem('user', JSON.stringify(userRes.data));
-        }
-      }
+  // Shared across all Student Coordinators on the same sub-event
+  const fetchBills = useCallback(async (targetSubEvent) => {
+    const subEventId =
+      typeof targetSubEvent === 'object' ? targetSubEvent?.id : targetSubEvent;
+    const subEventName =
+      typeof targetSubEvent === 'object' ? targetSubEvent?.name : '';
 
-      if (subEventId) {
-        const res = await axios.get(`http://localhost:8080/api/subevents/${subEventId}`);
-        setSubEvent(res.data);
-        setFacultyList(res.data.facultyHeads || []);
-        fetchBills(res.data.id);
-      } else {
-        setSubEvent(null);
-        setFacultyList([]);
-        setBills([]);
-      }
-    } catch (err) {
-      console.error('Failed to fetch assigned sub-event:', err);
-    } finally {
-      setLoadingEvent(false);
-    }
-  }, [currentUser]);
-
-  // 2. Fetch bills scoped to this subEventId from backend
-  const fetchBills = async (targetSubEventId) => {
-    const sId = targetSubEventId || subEvent?.id || currentUser?.assignedSubEventId;
-    if (!sId) {
+    if (!subEventId && !subEventName) {
       setBills([]);
       return;
     }
@@ -87,56 +135,106 @@ export default function StudentDashboard({ user }) {
     setLoadingBills(true);
     try {
       const res = await backendApi.get('/bills', {
-        params: { subEventId: sId },
+        params: subEventId ? { subEventId } : {},
       });
-      setBills(Array.isArray(res.data) ? res.data : []);
+      const rawList = Array.isArray(res.data) ? res.data : [];
+      const sharedSubEventBills =
+        subEventId || subEventName
+          ? rawList.filter((b) => {
+              const sid =
+                b.subEventId ?? b.sub_event_id ?? b.eventId ?? b.event_id;
+              if (subEventId && sid != null && String(sid) === String(subEventId)) {
+                return true;
+              }
+              return (
+                subEventName &&
+                b.eventName &&
+                b.eventName.toLowerCase().trim() ===
+                  subEventName.toLowerCase().trim()
+              );
+            })
+          : rawList;
+      setBills(sharedSubEventBills);
     } catch (err) {
-      console.warn('Backend unavailable, setting empty bills list:', err);
+      console.error('Failed to fetch bills:', err);
       setBills([]);
     } finally {
       setLoadingBills(false);
     }
-  };
+  }, []);
+
+  const fetchSubEventData = useCallback(async () => {
+    try {
+      setLoadingEvent(true);
+      let subEventId =
+        currentUser?.assignedSubEventId || currentUser?.subEventId;
+
+      if (currentUser?.id) {
+        try {
+          const userRes = await backendApi.get(`/users/${currentUser.id}`);
+          if (userRes.data) {
+            subEventId = userRes.data.assignedSubEventId || subEventId;
+            setCurrentUser(userRes.data);
+            localStorage.setItem('user', JSON.stringify(userRes.data));
+          }
+        } catch (err) {
+          console.warn('Could not refresh user assignment:', err);
+        }
+      }
+
+      if (subEventId) {
+        const res = await backendApi.get(`/subevents/${subEventId}`);
+        setSubEvent(res.data);
+        setCoordinatorList(res.data?.coordinators || []);
+        setFacultyList(res.data?.facultyHeads || []);
+        await fetchBills(res.data);
+      } else {
+        setSubEvent(null);
+        setCoordinatorList([]);
+        setFacultyList([]);
+        setBills([]);
+      }
+    } catch (err) {
+      console.error('Failed to load sub-event data:', err);
+    } finally {
+      setLoadingEvent(false);
+    }
+  }, [
+    currentUser?.id,
+    currentUser?.assignedSubEventId,
+    currentUser?.subEventId,
+    fetchBills,
+  ]);
 
   useEffect(() => {
     fetchSubEventData();
   }, [fetchSubEventData]);
 
-  // 3. Strict Defensive Sub-Event Scoping
-  const scopedBills = subEvent
-    ? bills.filter((b) => {
-        const matchesId =
-          b.subEventId && subEvent.id && String(b.subEventId) === String(subEvent.id);
-        const matchesName =
-          b.eventName &&
-          subEvent.name &&
-          b.eventName.toLowerCase().trim() === subEvent.name.toLowerCase().trim();
-        return matchesId || matchesName;
-      })
-    : [];
+  const resetForm = () => {
+    setSelectedFile(null);
+    setReceiptImage('');
+    setVendorName('');
+    setBillNo('');
+    setBillDate('');
+    setVendorGstin('');
+    setBaseAmount('');
+    setCgst('');
+    setSgst('');
+    setAmount('');
+    setRemarks('');
+    setReuploadRemark('');
+  };
 
-  // Separate rejected bills for immediate action
-  const rejectedBills = scopedBills.filter((b) => b.status === 'REJECTED');
-
-  // 4. Real-time metrics calculated strictly from scopedBills
-  const allocatedBudget = subEvent?.budgetCap ? Number(subEvent.budgetCap) : 0;
-  const advancePayment = subEvent?.advanceDisbursed ? Number(subEvent.advanceDisbursed) : 0;
-  const totalExpenditure = scopedBills
-    .filter((b) => b.status !== 'REJECTED')
-    .reduce((acc, curr) => acc + (Number(curr.amount) || 0), 0);
-  const remainingBalance = allocatedBudget - totalExpenditure;
-  const isBudgetWarning = allocatedBudget > 0 && totalExpenditure / allocatedBudget >= 0.8;
-
-  // File Selection & OCR Extraction
   const handleFileChange = async (e) => {
-    if (!e.target.files || !e.target.files[0]) return;
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-    const file = e.target.files[0];
-    setFileObject(file);
-    setSelectedFile(file.name);
-    setFilePreview(URL.createObjectURL(file));
+    setSelectedFile(file);
     setIsScanning(true);
-    setOcrError('');
+    setFeedback({ type: '', text: '' });
+
+    const dataUrl = await fileToCompressedDataUrl(file);
+    setReceiptImage(dataUrl);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -145,134 +243,209 @@ export default function StudentDashboard({ user }) {
       const response = await ocrApi.post('', formData);
       const extracted = response.data?.data || response.data || {};
 
-      setVendorName(extracted.vendorName || extracted.vendor_name || 'Vendor Not Detected');
-      setBillNo(extracted.billNo || extracted.bill_number || `GEN-${Date.now().toString().slice(-4)}`);
-      setAmount(extracted.amount || extracted.grand_total || extracted.total_amount || '0.00');
-      setBaseAmount(extracted.baseAmount || extracted.base_amount || extracted.amount || '0.00');
-      setBillDate(extracted.billDate || extracted.bill_date || new Date().toISOString().split('T')[0]);
-      setVendorGstin(extracted.vendorGstin || extracted.vendor_gstin || 'Unregistered / None');
-      setCgst(extracted.cgst || 0);
-      setSgst(extracted.sgst || 0);
-      setDescription(`Purchased for ${subEvent?.name || 'Assigned Sub-Event'}`);
+      setVendorName(extracted.vendorName || extracted.vendor_name || '');
+      setBillNo(extracted.billNo || extracted.bill_number || '');
+      setBillDate(extracted.billDate || extracted.bill_date || '');
+      setVendorGstin(extracted.vendorGstin || extracted.vendor_gstin || '');
+      setBaseAmount(
+        extracted.baseAmount !== undefined && extracted.baseAmount !== null
+          ? String(extracted.baseAmount)
+          : extracted.base_amount !== undefined
+          ? String(extracted.base_amount)
+          : ''
+      );
+      setCgst(
+        extracted.cgst !== undefined && extracted.cgst !== null
+          ? String(extracted.cgst)
+          : ''
+      );
+      setSgst(
+        extracted.sgst !== undefined && extracted.sgst !== null
+          ? String(extracted.sgst)
+          : ''
+      );
+      setAmount(
+        extracted.amount !== undefined && extracted.amount !== null
+          ? String(extracted.amount)
+          : extracted.grand_total !== undefined
+          ? String(extracted.grand_total)
+          : ''
+      );
+
+      showMessage(
+        'success',
+        'OCR scan completed. Extracted fields are locked; Faculty Head or Main Event Head can correct any discrepancies during review.'
+      );
     } catch (error) {
       console.error('OCR Extraction Failed:', error);
-      setOcrError('OCR microservice is offline or unreachable on port 5000.');
+      showMessage(
+        'error',
+        'Could not scan document via OCR service. Ensure the Python OCR server is running and try uploading a clearer image.'
+      );
     } finally {
       setIsScanning(false);
     }
   };
 
-  // Submit Bill with Explicit Sub-Event Identity
   const handleSubmitBill = async (e) => {
     e.preventDefault();
-    if (!amount || !vendorName) {
-      alert('Cannot submit an empty bill. Please re-upload a clear receipt.');
+
+    if (!subEvent?.id) {
+      showMessage(
+        'error',
+        'You are not assigned to a sub-event yet. Contact your Student Head to assign your sub-event.'
+      );
       return;
     }
-    if (!subEvent?.id) {
-      alert('You have not been assigned to a sub-event folder yet.');
+
+    if (!vendorName.trim() || !amount) {
+      showMessage(
+        'error',
+        'Please upload a receipt so OCR can populate Vendor Name and Grand Total Amount.'
+      );
+      return;
+    }
+
+    if (selectedRejectedBill && !reuploadRemark.trim()) {
+      showMessage(
+        'error',
+        'A remark is compulsory when re-uploading/resubmitting a rejected bill.'
+      );
       return;
     }
 
     setIsSubmitting(true);
     const parsedAmount = parseFloat(amount) || 0;
-    const parsedBaseAmount = parseFloat(baseAmount) || parsedAmount;
+    const parsedBase =
+      baseAmount !== '' ? parseFloat(baseAmount) || 0 : parsedAmount;
+    const parsedCgst = cgst !== '' ? parseFloat(cgst) || 0 : 0;
+    const parsedSgst = sgst !== '' ? parseFloat(sgst) || 0 : 0;
 
     const payload = {
-      vendorName,
-      billNo: billNo || 'GEN-' + Date.now().toString().slice(-4),
-      amount: parsedAmount,
-      baseAmount: parsedBaseAmount,
+      vendorName: vendorName.trim(),
+      billNo: billNo.trim() || `INV-${Date.now().toString().slice(-4)}`,
       billDate: billDate || new Date().toISOString().split('T')[0],
-      vendorGstin: vendorGstin || 'Unregistered',
-      cgst: parseFloat(cgst) || 0,
-      sgst: parseFloat(sgst) || 0,
+      vendorGstin: vendorGstin.trim() || 'Unregistered',
+      baseAmount: parsedBase,
+      cgst: parsedCgst,
+      sgst: parsedSgst,
+      amount: parsedAmount,
       eventName: subEvent.name,
       subEventId: subEvent.id,
-      description: description || `Submitted by Coordinator ${currentUser?.name || ''}`,
+      description: remarks.trim() || '',
+      remark: selectedRejectedBill ? reuploadRemark.trim() : remarks.trim() || '',
+      receiptImage: receiptImage || selectedRejectedBill?.receiptImage || null,
+      uploadedById: currentUser?.id,
+      uploadedByName: currentUser?.name || currentUser?.username,
+      uploadedByRole: 'STUDENT_COORDINATOR',
       status: 'PENDING_FACULTY',
     };
 
     try {
       if (selectedRejectedBill) {
-        await backendApi.put(`/bills/${selectedRejectedBill.id}`, payload);
-        alert('Corrected bill successfully re-submitted to the approval conveyor belt!');
+        await backendApi.put(
+          `/bills/${selectedRejectedBill.id}/reupload`,
+          payload
+        );
+        showMessage(
+          'success',
+          `Bill #${payload.billNo} re-submitted for Faculty approval.`
+        );
         setSelectedRejectedBill(null);
-        setIsReuploadModalOpen(false);
       } else {
         await backendApi.post('/bills', payload);
-        alert('Bill successfully submitted to the approval conveyor belt!');
+        showMessage(
+          'success',
+          `Bill #${payload.billNo} submitted for Faculty approval.`
+        );
       }
 
-      setSelectedFile(null);
-      setFileObject(null);
-      setFilePreview(null);
-      setVendorName('');
-      setBillNo('');
-      setAmount('');
-      setBaseAmount('');
-      setBillDate('');
-      setVendorGstin('');
-      setCgst(0);
-      setSgst(0);
-      setDescription('');
-      setOcrError('');
-      fetchBills(subEvent.id);
-      fetchSubEventData();
-      setActiveTab('My Bills');
+      resetForm();
+      await fetchSubEventData();
+      setActiveTab('bills');
     } catch (error) {
-      console.error('Backend submission failed:', error);
-      alert(error.response?.data?.message || 'Failed to connect to backend server.');
+      console.error('Failed to submit bill:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to submit bill. Please try again.'
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleOpenReuploadModal = (bill) => {
+  const openReuploadModal = (bill) => {
     setSelectedRejectedBill(bill);
+    setReceiptImage(bill.receiptImage || '');
     setVendorName(bill.vendorName || '');
     setBillNo(bill.billNo || '');
-    setAmount(bill.amount || '');
-    setBaseAmount(bill.baseAmount || bill.amount || '');
     setBillDate(bill.billDate || '');
     setVendorGstin(bill.vendorGstin || '');
-    setCgst(bill.cgst || 0);
-    setSgst(bill.sgst || 0);
-    setDescription(bill.description || '');
-    setIsReuploadModalOpen(true);
+    setBaseAmount(bill.baseAmount ?? bill.amount ?? '');
+    setCgst(bill.cgst ?? 0);
+    setSgst(bill.sgst ?? 0);
+    setAmount(bill.amount ?? '');
+    setRemarks(bill.description || '');
+    setReuploadRemark('');
   };
 
-  // Duplex PDF Voucher Generator
   const generateVoucherPdf = (bill) => {
     const doc = new jsPDF();
-
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(16);
     doc.text('GOVERNMENT COLLEGE OF ENGINEERING', 105, 20, { align: 'center' });
     doc.setFontSize(12);
-    doc.text('WINGS TECHNICAL FEST - EXPENSE VOUCHER', 105, 28, { align: 'center' });
+    doc.text('EXPENSE VOUCHER', 105, 28, { align: 'center' });
     doc.setLineWidth(0.5);
     doc.line(15, 32, 195, 32);
 
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(10);
     doc.text(`Voucher ID: BS-V-${bill.id || 'TEMP'}`, 16, 42);
-    doc.text(`Date of Submission: ${bill.billDate || 'N/A'}`, 130, 42);
-    doc.text(`Event / Sub-Event: ${bill.eventName || subEvent?.name || 'N/A'}`, 16, 50);
+    doc.text(`Bill Date: ${bill.billDate || 'N/A'}`, 130, 42);
+    doc.text(
+      `Sub-Event: ${bill.eventName || subEvent?.name || 'N/A'}`,
+      16,
+      50
+    );
     doc.text(`Coordinator: ${currentUser?.name || 'Coordinator'}`, 130, 50);
 
-    doc.rect(15, 56, 180, 50);
+    doc.rect(15, 56, 180, 56);
     doc.setFont('helvetica', 'bold');
     doc.text('EXPENSE AUDIT PARTICULARS', 20, 64);
     doc.setFont('helvetica', 'normal');
     doc.text(`Vendor Name: ${bill.vendorName || 'N/A'}`, 20, 74);
-    doc.text(`Vendor GSTIN: ${bill.vendorGstin || 'Unregistered / N/A'}`, 110, 74);
-    doc.text(`Bill / Invoice No: ${bill.billNo || 'N/A'}`, 20, 84);
-    doc.text(`Current Bill Amount: Rs. ${Number(bill.amount).toFixed(2)}`, 110, 84);
-    doc.text(`Allocated Sub-Event Budget: Rs. ${allocatedBudget.toFixed(2)}`, 20, 94);
-    doc.text(`Running Total Incurred: Rs. ${(bill.runningTotal || bill.amount).toFixed(2)}`, 110, 94);
+    doc.text(
+      `Vendor GSTIN: ${bill.vendorGstin || 'Unregistered'}`,
+      110,
+      74
+    );
+    doc.text(`Invoice No: ${bill.billNo || 'N/A'}`, 20, 84);
+    doc.text(
+      `Base Amount: INR ${Number(bill.baseAmount || bill.amount || 0).toFixed(2)}`,
+      110,
+      84
+    );
+    doc.text(
+      `CGST + SGST: INR ${(
+        Number(bill.cgst || 0) + Number(bill.sgst || 0)
+      ).toFixed(2)}`,
+      20,
+      94
+    );
+    doc.setFont('helvetica', 'bold');
+    doc.text(
+      `Grand Total: INR ${Number(bill.amount || 0).toFixed(2)}`,
+      110,
+      94
+    );
+    doc.text(
+      `Approved Running Total: INR ${Number(bill.runningTotal || 0).toFixed(2)}`,
+      20,
+      104
+    );
 
-    const sigY = 130;
+    const sigY = 132;
     doc.rect(15, sigY, 180, 35);
     doc.line(60, sigY, 60, sigY + 35);
     doc.line(105, sigY, 105, sigY + 35);
@@ -280,601 +453,833 @@ export default function StudentDashboard({ user }) {
 
     doc.setFontSize(8);
     doc.setFont('helvetica', 'bold');
-    doc.text('EVENT HEAD', 25, sigY + 8);
+    doc.text('COORDINATOR', 25, sigY + 8);
     doc.text('FACULTY HEAD', 68, sigY + 8);
-    doc.text('STOREKEEPER', 114, sigY + 8);
-    doc.text('PRINCIPAL', 160, sigY + 8);
+    doc.text('PRINCIPAL', 117, sigY + 8);
+    doc.text('STOREKEEPER', 158, sigY + 8);
 
     doc.setFont('helvetica', 'italic');
-    doc.text('Signed Digitally', 24, sigY + 28);
-    doc.text(bill.status !== 'PENDING_FACULTY' ? 'Approved' : 'Pending', 72, sigY + 28);
-    doc.text(bill.status === 'APPROVED' ? 'Recorded' : 'Pending', 118, sigY + 28);
-    doc.text(bill.status === 'APPROVED' ? 'Approved' : 'Pending', 162, sigY + 28);
+    doc.text('Submitted', 28, sigY + 28);
+    doc.text(
+      bill.status !== 'PENDING_FACULTY' ? 'Verified' : 'Pending',
+      74,
+      sigY + 28
+    );
+    doc.text(
+      bill.status === 'PENDING_STOREKEEPER' || bill.status === 'APPROVED'
+        ? 'Sanctioned'
+        : 'Pending',
+      118,
+      sigY + 28
+    );
+    doc.text(
+      bill.status === 'APPROVED' ? 'Logged' : 'Pending',
+      164,
+      sigY + 28
+    );
 
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.text('Note: Page 1 of Duplex Audit Record. Physical bill attached on reverse.', 105, 180, { align: 'center' });
-
-    doc.addPage();
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(14);
-    doc.text('ATTACHED RECEIPT / TAX INVOICE (BACKSIDE)', 105, 20, { align: 'center' });
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Bill Ref No: ${bill.billNo || 'N/A'} | Vendor: ${bill.vendorName || 'N/A'}`, 105, 28, { align: 'center' });
-
-    doc.setDrawColor(180, 180, 180);
-    doc.rect(20, 40, 170, 220);
-    doc.text('[ Physical Bill Image Affixed Here for Audit Inspection ]', 105, 140, { align: 'center' });
-
-    doc.save(`Voucher_${bill.billNo || 'BillStack'}.pdf`);
+    doc.save(`Voucher_${bill.billNo || bill.id}.pdf`);
   };
 
-  const renderConveyorStep = (currentStatus, stepIndex) => {
-    const stages = ['PENDING_FACULTY', 'PENDING_PRINCIPAL', 'PENDING_STOREKEEPER', 'APPROVED'];
-    const currentIdx = stages.indexOf(currentStatus);
-    const isComplete = currentIdx > stepIndex || currentStatus === 'APPROVED';
-    const isCurrent = currentIdx === stepIndex;
-
-    if (currentStatus === 'REJECTED') return 'bg-rose-500 text-white border-rose-600';
-    if (isComplete) return 'bg-emerald-500 text-white border-emerald-600';
-    if (isCurrent) return 'bg-violet-600 text-white border-violet-700 animate-pulse';
-    return 'bg-slate-100 text-slate-400 border-slate-200';
+  const handleSignOut = () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    if (typeof onLogout === 'function') onLogout();
+    navigate('/', { replace: true });
   };
+
+  const rejectedBills = bills.filter((b) => b.status === 'REJECTED');
+  const allocatedBudget = subEvent?.budgetCap ? Number(subEvent.budgetCap) : 0;
+  const advancePayment = subEvent?.advanceDisbursed
+    ? Number(subEvent.advanceDisbursed)
+    : 0;
+  const totalExpenditure = bills
+    .filter((b) => b.status === 'APPROVED')
+    .reduce((acc, curr) => acc + (Number(curr.amount) || 0), 0);
+  const remainingBalance = allocatedBudget - totalExpenditure;
+  const utilizationPct =
+    allocatedBudget > 0
+      ? Math.min(
+          Number(((totalExpenditure / allocatedBudget) * 100).toFixed(1)),
+          100
+        )
+      : 0;
+  const isBudgetWarning =
+    allocatedBudget > 0 && totalExpenditure / allocatedBudget >= 0.8;
+
+  const inputClass =
+    'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
+
+  const readOnlyOcrClass =
+    'w-full px-3.5 py-2 bg-sage-50/80 border border-sage-200 rounded-lg text-sm text-stone-700 cursor-not-allowed outline-none';
+
+  const navItems = [
+    { id: 'summary', label: 'Event Summary' },
+    { id: 'upload', label: 'Upload Bill' },
+    { id: 'bills', label: 'Track My Bills', count: bills.length },
+    { id: 'profile', label: 'Profile' },
+  ];
 
   return (
-    <div className="min-h-screen bg-slate-50 flex text-slate-800">
-      {/* Sidebar */}
-      <aside className="w-64 bg-violet-950 text-white flex flex-col justify-between p-6 shrink-0">
-        <div className="space-y-6">
+    <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
+      <header className="bg-white border-b border-sage-200 sticky top-0 z-30">
+        <div className="px-6 py-3.5 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-violet-600 flex items-center justify-center text-xl font-black shadow-lg">
-              B
-            </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight text-white">BillStack</h1>
-              <p className="text-xs text-violet-300 font-medium">Event Coordinator</p>
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-sage-900">
+                BillStack
+              </span>
+              <span className="text-stone-300">/</span>
+              <h1 className="text-sm font-medium text-stone-700">
+                Student Coordinator Portal
+              </h1>
             </div>
           </div>
 
-          <nav className="space-y-1.5 pt-4">
-            {sidebarItems.map((item) => (
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-medium text-stone-800 hidden sm:inline">
+              {currentUser?.name || currentUser?.username || 'Coordinator'}
+            </span>
+            <button
+              onClick={fetchSubEventData}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Refresh
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 bg-white border-r border-sage-200 p-4 shrink-0 hidden md:block">
+          <nav className="space-y-1.5">
+            {navItems.map((item) => (
               <button
-                key={item}
-                onClick={() => setActiveTab(item)}
-                className={`w-full text-left px-4 py-2.5 rounded-xl text-sm font-semibold transition flex items-center gap-3 ${
-                  activeTab === item
-                    ? 'bg-violet-800 text-white shadow-sm'
-                    : 'text-violet-200 hover:bg-violet-900/50 hover:text-white'
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
+                  activeTab === item.id
+                    ? 'bg-sage-100 text-sage-900 border border-sage-200'
+                    : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
                 }`}
               >
-                <span>{item === 'Dashboard' ? '📊' : item === 'Upload Bill' ? '📤' : item === 'My Bills' ? '📑' : '💰'}</span>
-                {item}
+                <span>{item.label}</span>
+                {item.count !== undefined && (
+                  <span className="text-xs px-2 py-0.5 rounded-md bg-white border border-sage-200 text-stone-600">
+                    {item.count}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
-        </div>
+        </aside>
 
-        <div className="pt-6 border-t border-violet-800/60">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-8 h-8 rounded-full bg-violet-700 flex items-center justify-center text-sm font-bold">
-              {currentUser?.name ? currentUser.name[0].toUpperCase() : 'C'}
-            </div>
-            <div className="overflow-hidden">
-              <p className="text-sm font-bold truncate">{currentUser?.name || 'Coordinator'}</p>
-              <p className="text-xs text-violet-300 truncate">{currentUser?.department || 'Department'}</p>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              localStorage.clear();
-              navigate('/');
-            }}
-            className="w-full py-2 bg-violet-900/80 hover:bg-violet-900 rounded-lg text-xs font-semibold text-violet-200 transition"
-          >
-            Log Out
-          </button>
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
-      <main className="flex-1 p-8 overflow-y-auto max-w-6xl space-y-6">
-        {/* Dynamic Sub-Event Header */}
-        <header className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-bold uppercase tracking-wider px-2.5 py-0.5 bg-violet-100 text-violet-800 rounded-md">
-                  {subEvent ? subEvent.department : (currentUser?.department || 'Not allotted yet')}
-                </span>
-                <span className="text-xs font-semibold text-slate-400">Wings TechFest Orchestration</span>
-              </div>
-              <h2 className="text-2xl font-black text-slate-900 tracking-tight mt-1">
-                {subEvent ? subEvent.name : 'Not allotted yet'}
-              </h2>
-            </div>
-
-            <div className="text-right">
-              <span className={`text-xs font-bold px-3 py-1.5 rounded-xl border ${subEvent ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
-                {subEvent ? `Lifecycle: ${subEvent.status || 'OPEN'}` : 'Not allotted yet'}
-              </span>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-slate-100 text-xs">
-            <div>
-              <span className="font-bold text-slate-400 uppercase tracking-wider block text-[10px]">Description</span>
-              <p className="text-slate-700 font-medium mt-0.5">
-                {subEvent?.description?.trim() ? subEvent.description : 'Not allotted yet'}
-              </p>
-            </div>
-            <div>
-              <span className="font-bold text-slate-400 uppercase tracking-wider block text-[10px]">Assigned Faculty Head(s)</span>
-              <p className="text-violet-900 font-bold mt-0.5">
-                {facultyList.length > 0
-                  ? facultyList.map((f) => f.name).join(', ')
-                  : 'Not allotted yet'}
-              </p>
-            </div>
-          </div>
-        </header>
-
-        {/* Action Required: Rejected Bills Section */}
-        {rejectedBills.length > 0 && (
-          <div className="bg-red-950/20 border border-red-500/20 rounded-2xl p-5 shadow-sm">
-            <h3 className="text-base font-black text-red-500 mb-3 flex items-center gap-2">
-              <span>⚠️</span> Action Required: Rejected Bills ({rejectedBills.length})
-            </h3>
-            <div className="grid gap-3">
-              {rejectedBills.map((bill) => (
-                <div key={bill.id} className="bg-white border border-red-200 rounded-xl p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-sm">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-slate-900 text-sm">{bill.vendorName}</span>
-                      <span className="text-[10px] px-2 py-0.5 rounded bg-red-100 text-red-700 font-bold border border-red-200">
-                        Rejected by {bill.rejectedBy || 'Authority'}
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Invoice #{bill.billNo} | Amount: ₹{bill.amount}
-                    </p>
-                    <div className="mt-2 text-xs bg-red-50 text-red-800 p-2.5 rounded-lg border border-red-200 font-medium">
-                      <strong>Reason for Rejection:</strong> {bill.rejectionReason || bill.remark || "No remark provided."}
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={() => handleOpenReuploadModal(bill)}
-                    className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs rounded-xl transition shadow whitespace-nowrap"
-                  >
-                    ✏️ Fix & Re-upload
-                  </button>
-                </div>
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto">
+          <div className="max-w-5xl mx-auto space-y-6">
+            <div className="flex gap-2 overflow-x-auto pb-1 md:hidden">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-medium shrink-0 transition cursor-pointer ${
+                    activeTab === item.id
+                      ? 'bg-sage-600 text-white'
+                      : 'bg-white border border-sage-200 text-stone-600'
+                  }`}
+                >
+                  {item.label}
+                </button>
               ))}
             </div>
-          </div>
-        )}
 
-        {/* High Utilization Alert */}
-        {isBudgetWarning && (
-          <div className="p-4 rounded-xl bg-amber-50 border-l-4 border-amber-500 text-amber-900 flex items-center justify-between shadow-sm">
-            <div className="flex items-center gap-3">
-              <span className="text-2xl">⚠️</span>
-              <div>
-                <p className="text-sm font-bold">Expenditure Cap Warning (High Utilization)</p>
-                <p className="text-xs text-amber-700">
-                  {subEvent?.name} has utilized {((totalExpenditure / allocatedBudget) * 100).toFixed(1)}% of its allocated fund.
-                </p>
-              </div>
-            </div>
-            <span className="px-3 py-1 rounded-full text-xs font-extrabold bg-amber-200 text-amber-900">
-              AUDIT ALERT
-            </span>
-          </div>
-        )}
-
-        {/* 4 Real-Time Metric Cards (Strictly Scoped) */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-            <p className="text-xs font-bold uppercase tracking-wider text-slate-400">Budget Allocated</p>
-            <p className="text-2xl font-black text-slate-900 mt-1">
-              ₹{allocatedBudget.toLocaleString('en-IN')}
-            </p>
-            <p className="text-xs text-slate-500 mt-1">{subEvent ? subEvent.name : 'Not allotted yet'}</p>
-          </div>
-
-          <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-            <p className="text-xs font-bold uppercase tracking-wider text-slate-400">Advance Payment</p>
-            <p className="text-2xl font-black text-amber-600 mt-1">
-              ₹{advancePayment.toLocaleString('en-IN')}
-            </p>
-            <p className="text-xs text-slate-500 mt-1">Cash in hand logged</p>
-          </div>
-
-          <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-            <p className="text-xs font-bold uppercase tracking-wider text-slate-400">Total Expenditure</p>
-            <p className="text-2xl font-black text-violet-700 mt-1">
-              ₹{totalExpenditure.toLocaleString('en-IN')}
-            </p>
-            <p className="text-xs text-slate-500 mt-1">{scopedBills.length} bills recorded</p>
-          </div>
-
-          <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-            <p className="text-xs font-bold uppercase tracking-wider text-slate-400">Remaining Balance</p>
-            <p className={`text-2xl font-black mt-1 ${remainingBalance < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-              ₹{remainingBalance.toLocaleString('en-IN')}
-            </p>
-            <p className="text-xs text-slate-500 mt-1">Real-time ledger sync</p>
-          </div>
-        </section>
-
-        {/* TAB 1: UPLOAD BILL */}
-        {activeTab === 'Upload Bill' && (
-          <section className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-6">
-            <div>
-              <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
-                <span>📤</span> Upload Receipt for Instant OCR Scan
-              </h3>
-              <p className="text-xs text-slate-500 mt-1">
-                Upload image or scan. Python OCR will parse invoice details and auto-fill the audit voucher.
-              </p>
-            </div>
-
-            <div className="border-2 border-dashed border-violet-200 hover:border-violet-500 bg-violet-50/40 rounded-2xl p-8 text-center transition flex flex-col items-center justify-center">
-              <span className="text-4xl mb-2">📄</span>
-              <p className="text-sm font-bold text-slate-800">
-                {selectedFile ? `Selected: ${selectedFile}` : 'Drag & drop bill receipt image or browse'}
-              </p>
-              <p className="text-xs text-slate-400 mt-1 mb-4">
-                Assigning to folder:{' '}
-                <span className="font-semibold text-violet-800">{subEvent ? subEvent.name : 'Not allotted yet'}</span>
-              </p>
-
-              <label className="cursor-pointer bg-violet-700 hover:bg-violet-800 text-white text-xs font-bold py-2.5 px-6 rounded-xl transition shadow">
-                Browse Bill
-                <input type="file" onChange={handleFileChange} className="hidden" accept="image/*,.pdf" />
-              </label>
-            </div>
-
-            {isScanning && (
-              <div className="p-4 rounded-xl bg-violet-50 border border-violet-200 text-center text-violet-800 text-sm font-bold animate-pulse flex items-center justify-center gap-2">
-                <span>🔍</span> Reading bill metadata with OCR AI... Please wait.
+            {feedback.text && (
+              <div
+                className={`px-4 py-3 rounded-lg border text-xs font-medium ${
+                  feedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : 'bg-sage-100 border-sage-200 text-sage-900'
+                }`}
+              >
+                {feedback.text}
               </div>
             )}
 
-            {ocrError && (
-              <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-medium">
-                ⚠️ {ocrError}
-              </div>
-            )}
+            {/* EVENT SUMMARY TAB */}
+            {activeTab === 'summary' && (
+              <div className="space-y-6">
+                <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <span className="text-[11px] font-medium px-2.5 py-0.5 bg-sage-100 border border-sage-200 text-sage-800 rounded-md">
+                        {subEvent?.department ||
+                          currentUser?.department ||
+                          'Unassigned'}
+                      </span>
+                      <h2 className="text-xl font-semibold text-stone-900 mt-2">
+                        {loadingEvent
+                          ? 'Loading...'
+                          : subEvent
+                          ? subEvent.name
+                          : 'Not Allotted Yet'}
+                      </h2>
+                    </div>
+                    <span className="text-xs font-medium px-3 py-1.5 bg-sage-50 border border-sage-200 text-sage-800 rounded-lg self-start sm:self-auto">
+                      Status:{' '}
+                      {subEvent ? subEvent.status || 'OPEN' : 'Unassigned'}
+                    </span>
+                  </div>
 
-            {(vendorName || fileObject) && !isScanning && (
-              <form onSubmit={handleSubmitBill} className="p-6 rounded-2xl bg-slate-50 border border-slate-200 space-y-4">
-                <div className="flex items-center justify-between border-b border-slate-200 pb-3">
-                  <div>
-                    <h4 className="text-xs font-black uppercase tracking-wider text-slate-700">
-                      Extracted Voucher Particulars
-                    </h4>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      🔒 Read-only for Event Coordinators. Any misdetected values will be corrected by your Faculty Advisor.
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 border-t border-sage-100 text-sm">
+                    <div>
+                      <span className="text-xs font-medium text-stone-500 block mb-1">
+                        Description
+                      </span>
+                      <p className="text-stone-800">
+                        {subEvent?.description?.trim()
+                          ? subEvent.description
+                          : 'Not allotted yet'}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-xs font-medium text-stone-500 block mb-1">
+                        Assigned Faculty Head(s)
+                      </span>
+                      <p className="text-stone-900 font-medium">
+                        {facultyList.length > 0
+                          ? facultyList.map((f) => f.name).join(', ')
+                          : 'Not allotted yet'}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-xs font-medium text-stone-500 block mb-1">
+                        Co-Assigned Coordinators
+                      </span>
+                      <p className="text-stone-900 font-medium">
+                        {coordinatorList.length > 0
+                          ? coordinatorList.map((c) => c.name).join(', ')
+                          : currentUser?.name || 'Not allotted yet'}
+                      </p>
+                    </div>
+                  </div>
+                </section>
+
+                {isBudgetWarning && (
+                  <div className="px-4 py-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900">
+                    <strong className="font-semibold">Budget Warning:</strong>{' '}
+                    {subEvent?.name} has utilized {utilizationPct}% of its
+                    sanctioned allocation (approved bills).
+                  </div>
+                )}
+
+                {rejectedBills.length > 0 && (
+                  <section className="bg-rose-50/70 border border-rose-200 rounded-xl p-5 space-y-3">
+                    <h3 className="text-sm font-semibold text-rose-800">
+                      Action Required: Rejected Bills ({rejectedBills.length})
+                    </h3>
+                    <div className="space-y-2.5">
+                      {rejectedBills.map((bill) => (
+                        <div
+                          key={bill.id}
+                          className="bg-white border border-rose-200 rounded-lg p-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3"
+                        >
+                          <div>
+                            <p className="text-sm font-semibold text-stone-900">
+                              {bill.vendorName}{' '}
+                              <span className="font-mono text-xs text-stone-500">
+                                #{bill.billNo}
+                              </span>
+                            </p>
+                            <p className="text-xs text-rose-700 mt-1">
+                              Reason:{' '}
+                              {bill.rejectionReason ||
+                                bill.remark ||
+                                'Correction required.'}
+                            </p>
+                          </div>
+                          <button
+                            onClick={() => openReuploadModal(bill)}
+                            className="px-3.5 py-1.5 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-medium transition cursor-pointer shrink-0"
+                          >
+                            Re-upload Bill
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                    <p className="text-xs font-medium text-stone-500">
+                      Budget Allocated
+                    </p>
+                    <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                      INR {allocatedBudget.toLocaleString('en-IN')}
                     </p>
                   </div>
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                    Auto-Captured via OCR
+
+                  <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                    <p className="text-xs font-medium text-stone-500">
+                      Advance Payment
+                    </p>
+                    <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                      INR {advancePayment.toLocaleString('en-IN')}
+                    </p>
+                  </div>
+
+                  <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                    <p className="text-xs font-medium text-stone-500">
+                      Approved Expenditure
+                    </p>
+                    <p className="text-2xl font-semibold text-sage-800 mt-1.5">
+                      INR {totalExpenditure.toLocaleString('en-IN')}
+                    </p>
+                  </div>
+
+                  <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                    <p className="text-xs font-medium text-stone-500">
+                      Remaining Balance
+                    </p>
+                    <p
+                      className={`text-2xl font-semibold mt-1.5 ${
+                        remainingBalance < 0
+                          ? 'text-rose-700'
+                          : 'text-stone-900'
+                      }`}
+                    >
+                      INR {remainingBalance.toLocaleString('en-IN')}
+                    </p>
+                  </div>
+                </section>
+
+                <SubEventAnalytics
+                  allocatedBudget={allocatedBudget}
+                  bills={bills}
+                />
+              </div>
+            )}
+
+            {/* UPLOAD BILL TAB */}
+            {activeTab === 'upload' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-5">
+                <div className="pb-4 border-b border-sage-100 flex items-center justify-between gap-2">
+                  <h2 className="text-base font-semibold text-stone-900">
+                    Upload &amp; Scan Invoice
+                  </h2>
+                  <span className="text-xs font-medium text-sage-800 bg-sage-50 border border-sage-200 px-2.5 py-1 rounded-md">
+                    {subEvent ? subEvent.name : 'Unassigned'}
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <form onSubmit={handleSubmitBill} className="space-y-5">
                   <div>
-                    <label className="text-xs font-bold text-slate-600">Vendor Name</label>
-                    <input
-                      type="text"
-                      value={vendorName}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 font-semibold text-slate-800 cursor-not-allowed select-none"
-                    />
+                    <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                      Receipt Document (Image / PDF) *
+                    </label>
+                    <div className="p-4 bg-sage-50/70 border border-dashed border-sage-300 rounded-lg space-y-3">
+                      <input
+                        type="file"
+                        accept="image/*,.pdf"
+                        onChange={handleFileChange}
+                        className="w-full text-xs text-stone-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border file:border-sage-200 file:text-xs file:font-medium file:bg-white file:text-sage-800 hover:file:bg-sage-100 file:cursor-pointer"
+                      />
+                      {selectedFile && (
+                        <p className="text-[11px] text-stone-500 truncate">
+                          Selected:{' '}
+                          <span className="font-medium text-stone-700">
+                            {selectedFile.name}
+                          </span>
+                        </p>
+                      )}
+                      {receiptImage &&
+                        !receiptImage.startsWith('data:application/pdf') && (
+                          <img
+                            src={receiptImage}
+                            alt="Uploaded receipt preview"
+                            className="max-h-48 rounded border border-sage-200 bg-white object-contain"
+                          />
+                        )}
+                    </div>
                   </div>
 
-                  <div>
-                    <label className="text-xs font-bold text-slate-600">Invoice / Bill Number</label>
-                    <input
-                      type="text"
-                      value={billNo}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 font-semibold text-slate-800 cursor-not-allowed font-mono select-none"
-                    />
+                  {isScanning && (
+                    <div className="px-3.5 py-2.5 bg-sage-50 border border-sage-200 rounded-lg text-xs text-sage-800">
+                      Scanning document and extracting fields...
+                    </div>
+                  )}
+
+                  <div className="px-3.5 py-2 bg-amber-50/70 border border-amber-200 rounded-lg text-[11px] text-amber-900">
+                    OCR fields below are auto-populated and read-only. Only Faculty Head and Main Event Head can override extracted values during review.
                   </div>
 
-                  <div>
-                    <label className="text-xs font-bold text-slate-600">Base Taxable Amount (₹)</label>
-                    <input
-                      type="text"
-                      value={baseAmount}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 font-semibold text-slate-800 cursor-not-allowed select-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-bold text-slate-600">Grand Total Amount (₹)</label>
-                    <input
-                      type="text"
-                      value={amount}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 font-black text-violet-900 cursor-not-allowed select-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-bold text-slate-600">Bill Date</label>
-                    <input
-                      type="text"
-                      value={billDate}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 font-semibold text-slate-800 cursor-not-allowed select-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-bold text-slate-600">Vendor GSTIN (Tax ID)</label>
-                    <input
-                      type="text"
-                      value={vendorGstin}
-                      readOnly
-                      className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 text-xs font-mono text-slate-700 cursor-not-allowed select-none"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                      <label className="text-xs font-bold text-slate-600">CGST (₹)</label>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Vendor Name (OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={vendorName}
+                        readOnly
+                        placeholder="Auto-filled after upload"
+                        className={readOnlyOcrClass}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Invoice Number (OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={billNo}
+                        readOnly
+                        placeholder="Auto-filled after upload"
+                        className={`${readOnlyOcrClass} font-mono`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Bill Date (OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={billDate}
+                        readOnly
+                        placeholder="Auto-filled after upload"
+                        className={readOnlyOcrClass}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Vendor GSTIN (OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={vendorGstin}
+                        readOnly
+                        placeholder="Auto-filled after upload"
+                        className={`${readOnlyOcrClass} font-mono`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Base Amount (INR, OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={baseAmount}
+                        readOnly
+                        placeholder="0.00"
+                        className={readOnlyOcrClass}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Grand Total Amount (INR, OCR)
+                      </label>
+                      <input
+                        type="text"
+                        value={amount}
+                        readOnly
+                        placeholder="0.00"
+                        className={`${readOnlyOcrClass} font-semibold`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        CGST (INR, OCR)
+                      </label>
                       <input
                         type="text"
                         value={cgst}
                         readOnly
-                        className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 text-slate-700 cursor-not-allowed select-none"
+                        placeholder="0.00"
+                        className={readOnlyOcrClass}
                       />
                     </div>
+
                     <div>
-                      <label className="text-xs font-bold text-slate-600">SGST (₹)</label>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        SGST (INR, OCR)
+                      </label>
                       <input
                         type="text"
                         value={sgst}
                         readOnly
-                        className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-200 bg-slate-100 text-slate-700 cursor-not-allowed select-none"
+                        placeholder="0.00"
+                        className={readOnlyOcrClass}
                       />
                     </div>
                   </div>
-                </div>
 
-                <div>
-                  <label className="text-xs font-bold text-slate-600">Expense Purpose / Activity Description</label>
-                  <textarea
-                    rows={2}
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Briefly describe what items were purchased..."
-                    className="w-full mt-1 p-2.5 text-sm rounded-xl border border-slate-300 bg-white"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Remarks (Optional)
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={remarks}
+                      onChange={(e) => setRemarks(e.target.value)}
+                      placeholder="Optional notes about items purchased or OCR discrepancies for Faculty review..."
+                      className={inputClass}
+                    />
+                  </div>
 
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-3 bg-violet-700 hover:bg-violet-800 disabled:bg-violet-400 text-white rounded-xl text-sm font-bold shadow transition flex items-center justify-center gap-2"
-                >
-                  {isSubmitting ? 'Forwarding to Faculty Review...' : '✓ Confirm & Forward to Faculty Review'}
-                </button>
-              </form>
+                  <div className="flex items-center gap-3 pt-1">
+                    <button
+                      type="submit"
+                      disabled={
+                        isSubmitting || isScanning || !vendorName || !amount
+                      }
+                      className="px-6 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      {isSubmitting ? 'Submitting...' : 'Submit for Approval'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={resetForm}
+                      className="px-4 py-2.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 text-sm font-medium rounded-lg transition cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </form>
+              </section>
             )}
-          </section>
-        )}
 
-        {/* TAB 2 & 3: MY BILLS & TRACKING PIPELINE (Render scopedBills Only) */}
-        {(activeTab === 'My Bills' || activeTab === 'Dashboard') && (
-          <section className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
-                  <span>📑</span> Sequential Approval Conveyor Belt
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Track bill verification progress: Event Head → Faculty → Principal → Storekeeper
-                </p>
-              </div>
+            {/* TRACK MY BILLS TAB */}
+            {activeTab === 'bills' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-sage-100">
+                  <div>
+                    <h2 className="text-base font-semibold text-stone-900">
+                      Sub-Event Bills ({bills.length})
+                    </h2>
+                    <p className="text-xs text-stone-500">
+                      Visible to all Student Coordinators assigned to{' '}
+                      {subEvent?.name || 'this sub-event'}.
+                    </p>
+                  </div>
+                </div>
+
+                {loadingBills ? (
+                  <div className="py-10 text-center text-xs text-stone-500">
+                    Loading bills...
+                  </div>
+                ) : bills.length === 0 ? (
+                  <div className="py-10 px-4 text-center bg-sage-50/50 border border-sage-200/80 rounded-lg text-xs text-stone-500">
+                    No bills uploaded for this sub-event yet.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {bills.map((bill) => {
+                      const stageIdx = getStageIndex(bill.status);
+                      const isRejected = bill.status === 'REJECTED';
+
+                      return (
+                        <div
+                          key={bill.id}
+                          className="p-5 bg-sage-50/35 border border-sage-200 rounded-xl space-y-4"
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-sm font-semibold text-stone-900">
+                                  {bill.vendorName}
+                                </span>
+                                <span className="text-[11px] font-mono text-stone-500 bg-white border border-sage-200 px-2 py-0.5 rounded">
+                                  #{bill.billNo || bill.id}
+                                </span>
+                                <span
+                                  className={`px-2 py-0.5 text-[11px] font-medium rounded-md border ${getStatusBadgeClass(
+                                    bill.status
+                                  )}`}
+                                >
+                                  {bill.status}
+                                </span>
+                              </div>
+                              <p className="text-xs text-stone-500 mt-1">
+                                Date: {bill.billDate || 'N/A'} &middot; GSTIN:{' '}
+                                {bill.vendorGstin || 'Unregistered'}
+                                {bill.uploadedByName
+                                  ? ` · By ${bill.uploadedByName}`
+                                  : ''}
+                              </p>
+                            </div>
+
+                            <div className="flex items-center gap-3 shrink-0">
+                              <div className="text-right">
+                                <p className="text-base font-semibold text-stone-900">
+                                  INR {Number(bill.amount || 0).toFixed(2)}
+                                </p>
+                                <p className="text-[11px] text-stone-500">
+                                  {bill.status === 'APPROVED'
+                                    ? `Approved Total: INR ${Number(
+                                        bill.runningTotal || 0
+                                      ).toFixed(2)}`
+                                    : 'Pending final approval'}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => generateVoucherPdf(bill)}
+                                className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium transition cursor-pointer"
+                              >
+                                PDF
+                              </button>
+                              <button
+                                onClick={() => setSelectedBillForAudit(bill.id)}
+                                className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium transition cursor-pointer"
+                              >
+                                Logs
+                              </button>
+                            </div>
+                          </div>
+
+                          {isRejected ? (
+                            <div className="px-3.5 py-2.5 bg-rose-50 border border-rose-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-rose-700">
+                              <span>
+                                Rejected:{' '}
+                                {bill.rejectionReason ||
+                                  bill.remark ||
+                                  'Returned for correction.'}
+                              </span>
+                              <button
+                                onClick={() => openReuploadModal(bill)}
+                                className="px-3 py-1 bg-white border border-rose-200 text-rose-700 rounded-md font-medium hover:bg-rose-50 cursor-pointer self-start sm:self-auto"
+                              >
+                                Re-upload Bill
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-4 gap-2 pt-2 border-t border-sage-200/70">
+                              {APPROVAL_STAGES.map((stage, idx) => {
+                                const done = stageIdx > idx;
+                                const active = stageIdx === idx;
+                                return (
+                                  <div key={stage.key} className="space-y-1">
+                                    <div
+                                      className={`h-1.5 rounded-full ${
+                                        done
+                                          ? 'bg-sage-600'
+                                          : active
+                                          ? 'bg-sage-300'
+                                          : 'bg-sage-100'
+                                      }`}
+                                    />
+                                    <p
+                                      className={`text-[11px] truncate ${
+                                        done
+                                          ? 'text-sage-800 font-medium'
+                                          : active
+                                          ? 'text-stone-700 font-medium'
+                                          : 'text-stone-400'
+                                      }`}
+                                    >
+                                      {stage.label}
+                                    </p>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* PROFILE TAB */}
+            {activeTab === 'profile' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] max-w-lg space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Profile
+                </h2>
+                <div className="space-y-3 text-sm">
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Full Name</span>
+                    <span className="font-medium text-stone-900">
+                      {currentUser?.name || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Username</span>
+                    <span className="font-mono text-stone-800">
+                      {currentUser?.username || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Roll / ID</span>
+                    <span className="font-mono text-stone-800">
+                      {currentUser?.institutionalId || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Department</span>
+                    <span className="text-stone-800">
+                      {currentUser?.department || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2">
+                    <span className="text-stone-500">Assigned Sub-Event</span>
+                    <span className="font-medium text-sage-800">
+                      {subEvent ? subEvent.name : 'Not Allotted Yet'}
+                    </span>
+                  </div>
+                </div>
+              </section>
+            )}
+          </div>
+        </main>
+      </div>
+
+      {/* REUPLOAD MODAL (Re-scan receipt + compulsory remark) */}
+      {selectedRejectedBill && (
+        <div className="fixed inset-0 bg-stone-900/40 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-sage-200 rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.08)] w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden">
+            <div className="px-6 py-4 border-b border-sage-100 bg-sage-50/60 flex justify-between items-center">
+              <h3 className="text-base font-semibold text-stone-900">
+                Re-upload Rejected Bill
+              </h3>
               <button
-                onClick={() => fetchSubEventData()}
-                className="px-3 py-1.5 text-xs font-bold bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-700 shadow-sm"
+                onClick={() => {
+                  setSelectedRejectedBill(null);
+                  resetForm();
+                }}
+                className="text-xs font-medium text-stone-500 hover:text-stone-800 cursor-pointer"
               >
-                ↻ Refresh Ledger
+                Close
               </button>
             </div>
 
-            {loadingBills ? (
-              <div className="p-8 text-center text-sm font-semibold text-slate-400">Loading bills...</div>
-            ) : scopedBills.length === 0 ? (
-              <div className="p-12 text-center bg-slate-50 rounded-2xl border border-dashed border-slate-200 text-slate-400">
-                No bills uploaded for this event folder yet.
+            <form
+              onSubmit={handleSubmitBill}
+              className="p-6 overflow-y-auto space-y-4"
+            >
+              <div className="px-3.5 py-2.5 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                <strong>Rejection Reason:</strong>{' '}
+                {selectedRejectedBill.rejectionReason ||
+                  selectedRejectedBill.remark ||
+                  'Correction required.'}
               </div>
-            ) : (
-              <div className="space-y-4">
-                {scopedBills.map((bill) => (
-                  <div key={bill.id} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4">
-                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-2">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-black text-slate-900">{bill.vendorName}</span>
-                          <span className="text-xs px-2 py-0.5 rounded bg-slate-100 font-mono text-slate-600">
-                            #{bill.billNo}
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-400 mt-0.5">
-                          {bill.eventName} • Incurred on: {bill.billDate}
-                        </p>
-                      </div>
 
-                      <div className="flex items-center gap-4">
-                        <div className="text-right">
-                          <p className="text-base font-black text-slate-900">₹{Number(bill.amount).toFixed(2)}</p>
-                          <p className="text-[10px] text-slate-400 font-semibold">
-                            Folder Running Total: ₹{(bill.runningTotal || bill.amount).toFixed(2)}
-                          </p>
-                        </div>
-                        <button
-                          onClick={() => generateVoucherPdf(bill)}
-                          className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition shadow-sm flex items-center gap-1.5"
-                          title="Generate Government-compliant duplex alternating PDF"
-                        >
-                          <span>🖨️</span> Close & Print
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 border-t border-slate-100">
-                      <div className="grid grid-cols-4 gap-2 text-center">
-                        {[
-                          { label: 'Event Head', role: 'SUBMITTED' },
-                          { label: 'Faculty Review', role: 'PENDING_FACULTY' },
-                          { label: 'Principal Approval', role: 'PENDING_PRINCIPAL' },
-                          { label: 'Storekeeper Note', role: 'PENDING_STOREKEEPER' },
-                        ].map((stage, idx) => (
-                          <div key={stage.label} className="flex flex-col items-center">
-                            <div
-                              className={`w-full py-1 text-[11px] font-extrabold rounded-md border ${renderConveyorStep(
-                                bill.status,
-                                idx
-                              )}`}
-                            >
-                              {stage.label}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-
-        {/* TAB 4: BUDGET OVERVIEW */}
-        {activeTab === 'Budget Overview' && (
-          <section className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
-            <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
-              <span>💰</span> Sub-Event Fund Allocation & Compliance
-            </h3>
-            <div className="space-y-3">
-              <div className="flex justify-between text-xs font-bold">
-                <span className="text-slate-500">Utilization Rate</span>
-                <span className={isBudgetWarning ? 'text-rose-600' : 'text-violet-900'}>
-                  {allocatedBudget > 0 ? ((totalExpenditure / allocatedBudget) * 100).toFixed(1) : '0.0'}%
-                </span>
-              </div>
-              <div className="w-full h-3 rounded-full bg-slate-100 overflow-hidden">
-                <div
-                  className={`h-full transition-all duration-500 ${
-                    isBudgetWarning ? 'bg-rose-500' : 'bg-violet-600'
-                  }`}
-                  style={{ width: `${allocatedBudget > 0 ? Math.min((totalExpenditure / allocatedBudget) * 100, 100) : 0}%` }}
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4 text-xs">
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
-                <p className="text-slate-400 font-bold uppercase">Assigned Faculty Advisor(s)</p>
-                <p className="text-sm font-bold text-slate-800 mt-1">
-                  {facultyList.length > 0 ? facultyList.map((f) => f.name).join(', ') : 'Not allotted yet'}
-                </p>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
-                <p className="text-slate-400 font-bold uppercase">Storekeeper Ledger Status</p>
-                <p className="text-sm font-bold text-slate-800 mt-1">Digital Book Synchronized</p>
-              </div>
-            </div>
-          </section>
-        )}
-      </main>
-
-      {/* RE-UPLOAD MODAL FOR REJECTED BILLS */}
-      {isReuploadModalOpen && (
-        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl p-6 space-y-4 max-h-[90vh] overflow-y-auto">
-            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
-              <h3 className="text-base font-bold text-slate-900">Fix & Re-upload Rejected Bill</h3>
-              <button onClick={() => setIsReuploadModalOpen(false)} className="text-slate-400 hover:text-slate-600 font-bold text-lg">✕</button>
-            </div>
-
-            <div className="bg-amber-50 p-3 rounded-xl border border-amber-200 text-xs text-amber-900">
-              <strong>Rejection Reason:</strong> {selectedRejectedBill?.rejectionReason || selectedRejectedBill?.remark || "Please correct the errors and re-submit."}
-            </div>
-
-            <form onSubmit={handleSubmitBill} className="space-y-4 text-xs">
               <div>
-                <label className="block font-bold text-slate-700 uppercase mb-1">Vendor Name</label>
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Upload Clearer / Updated Receipt (OCR Re-Scan)
+                </label>
                 <input
-                  type="text"
-                  value={vendorName}
-                  onChange={(e) => setVendorName(e.target.value)}
-                  className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
-                  required
+                  type="file"
+                  accept="image/*,.pdf"
+                  onChange={handleFileChange}
+                  className="w-full text-xs text-stone-600"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-stone-600 mb-1">
+                    Vendor Name (OCR)
+                  </label>
+                  <input
+                    type="text"
+                    value={vendorName}
+                    readOnly
+                    className={readOnlyOcrClass}
+                  />
+                </div>
                 <div>
-                  <label className="block font-bold text-slate-700 uppercase mb-1">Bill Number</label>
+                  <label className="block text-xs font-medium text-stone-600 mb-1">
+                    Invoice Number (OCR)
+                  </label>
                   <input
                     type="text"
                     value={billNo}
-                    onChange={(e) => setBillNo(e.target.value)}
-                    className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
-                    required
+                    readOnly
+                    className={`${readOnlyOcrClass} font-mono`}
                   />
                 </div>
                 <div>
-                  <label className="block font-bold text-slate-700 uppercase mb-1">Amount (₹)</label>
+                  <label className="block text-xs font-medium text-stone-600 mb-1">
+                    Grand Total (INR, OCR)
+                  </label>
                   <input
-                    type="number"
+                    type="text"
                     value={amount}
-                    onChange={(e) => setAmount(e.target.print || e.target.value)}
-                    className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
-                    required
+                    readOnly
+                    className={readOnlyOcrClass}
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block font-bold text-slate-700 uppercase mb-1">Correction Notes / Remarks</label>
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Resubmission Remark *
+                </label>
                 <textarea
                   rows={2}
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Explain corrections made..."
-                  className="w-full p-2.5 border border-slate-300 rounded-xl font-medium"
+                  required
+                  value={reuploadRemark}
+                  onChange={(e) => setReuploadRemark(e.target.value)}
+                  placeholder="Explain the fix made for this rejection..."
+                  className={inputClass}
                 />
               </div>
 
-              <div className="flex justify-end gap-3 pt-2">
+              <div>
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Additional Notes (Optional)
+                </label>
+                <textarea
+                  rows={2}
+                  value={remarks}
+                  onChange={(e) => setRemarks(e.target.value)}
+                  className={inputClass}
+                />
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  onClick={() => setIsReuploadModalOpen(false)}
-                  className="px-4 py-2 border border-slate-300 rounded-xl font-bold text-slate-600 hover:bg-slate-50"
+                  onClick={() => {
+                    setSelectedRejectedBill(null);
+                    resetForm();
+                  }}
+                  className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmitting}
-                  className="px-5 py-2 bg-violet-700 hover:bg-violet-800 text-white font-bold rounded-xl shadow transition"
+                  disabled={isSubmitting || isScanning}
+                  className="px-4 py-2 bg-sage-600 hover:bg-sage-700 text-white rounded-lg text-xs font-medium cursor-pointer"
                 >
-                  {isSubmitting ? 'Submitting...' : 'Submit Correction'}
+                  {isSubmitting ? 'Submitting...' : 'Re-submit Bill'}
                 </button>
               </div>
             </form>
           </div>
         </div>
+      )}
+
+      {selectedBillForAudit && (
+        <AuditLogModal
+          billId={selectedBillForAudit}
+          onClose={() => setSelectedBillForAudit(null)}
+        />
       )}
     </div>
   );

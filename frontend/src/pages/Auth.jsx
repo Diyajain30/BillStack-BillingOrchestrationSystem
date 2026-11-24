@@ -1,48 +1,42 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import axios from 'axios';
+import { backendApi } from '../services/api';
+
+const USER_ROLES = [
+  { value: 'STUDENT_COORDINATOR', label: 'Student Coordinator' },
+  { value: 'STUDENT_HEAD', label: 'Student Head' },
+  { value: 'MAIN_EVENT_HEAD', label: 'Main Event Head' },
+  { value: 'FACULTY', label: 'Faculty Head' },
+  { value: 'PRINCIPAL', label: 'Principal' },
+  { value: 'STOREKEEPER', label: 'Storekeeper' },
+  { value: 'ACCOUNTS', label: 'Accounts Section' },
+];
 
 export default function Auth() {
   const navigate = useNavigate();
 
-  const [isLogin, setIsLogin] = useState(true);
+  const [loginMode, setLoginMode] = useState('user'); // 'user' | 'admin'
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   const [formData, setFormData] = useState({
     username: '',
     password: '',
-    confirmPassword: '',
-    name: '',
-    institutionalId: '',
-    department: 'Computer Engineering',
     role: 'STUDENT_COORDINATOR',
   });
 
-  const roles = [
-    { value: 'STUDENT_COORDINATOR', label: 'Student Coordinator' },
-    { value: 'STUDENT_HEAD', label: 'Student Head Coordinator' },
-    { value: 'MAIN_EVENT_HEAD', label: 'Main Event Head' },
-    { value: 'FACULTY', label: 'Faculty Head' },
-    { value: 'PRINCIPAL', label: 'Principal' },
-    { value: 'STOREKEEPER', label: 'Storekeeper' },
-    { value: 'ACCOUNTS', label: 'Accounts Section' },
-  ];
-
-  const departments = [
-    'Computer Engineering',
-    'Information Technology',
-    'Mechanical Engineering',
-    'Electrical Engineering',
-    'Civil Engineering',
-    'Electronics & Telecommunication',
-  ];
-
-  const isStudentRole = formData.role === 'STUDENT_COORDINATOR' || formData.role === 'STUDENT_HEAD';
-  const showDepartmentField = !isLogin && (formData.role === 'STUDENT_COORDINATOR' || formData.role === 'FACULTY');
+  const handleModeSwitch = (mode) => {
+    setLoginMode(mode);
+    setError('');
+    setFormData((prev) => ({
+      ...prev,
+      username: '',
+      password: '',
+    }));
+  };
 
   const handleChange = (e) => {
-    setFormData({ ...formData, [e.target.name]: e.target.value });
+    setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
     if (error) setError('');
   };
 
@@ -50,233 +44,163 @@ export default function Auth() {
     e.preventDefault();
     setError('');
 
-    if (formData.password.length < 4) {
-      setError('Password must be at least 4 characters long.');
+    if (!formData.username.trim()) {
+      setError('Please enter your username.');
       return;
     }
 
-    if (!isLogin && formData.password !== formData.confirmPassword) {
-      setError('Passwords do not match.');
+    if (formData.password.length < 4) {
+      setError('Password must be at least 4 characters long.');
       return;
     }
 
     setLoading(true);
 
     try {
-      if (!isLogin) {
-        // --- REGISTRATION ---
-        const userPayload = {
-          name: formData.name,
-          username: formData.username,
-          institutionalId: formData.institutionalId,
-          password: formData.password,
-          role: formData.role,
-          department: showDepartmentField ? formData.department : null,
-        };
+      const payload = {
+        username: formData.username.trim(),
+        password: formData.password,
+        role: loginMode === 'admin' ? 'ADMIN' : formData.role,
+      };
 
-        const response = await axios.post('http://localhost:8080/api/users', userPayload);
+      const response = await backendApi.post('/users/login', payload);
 
-        if (response.status === 201 || response.status === 200) {
-          alert('Account created successfully! Please log in with your credentials and selected role.');
-          setIsLogin(true);
-          setFormData((prev) => ({
-            ...prev,
-            password: '',
-            confirmPassword: '',
-          }));
-        }
+      if (response.status === 200 && response.data?.user) {
+        const { token, user } = response.data;
+        if (token) localStorage.setItem('token', token);
+        localStorage.setItem('user', JSON.stringify(user));
+        navigate('/dashboard', { state: { user } });
       } else {
-        // --- ROLE-CONFIRMED LOGIN ---
-        const response = await axios.post('http://localhost:8080/api/users/login', {
-          username: formData.username,
-          password: formData.password,
-          role: formData.role,
-        });
-
-        if (response.status === 200) {
-          const { token, user } = response.data;
-          // Store token and user metadata uniformly across browser sessions
-          localStorage.setItem('token', token);
-          localStorage.setItem('user', JSON.stringify(user));
-          navigate('/dashboard', { state: { user } });
-        }
+        setError('Unexpected response from server. Please try again.');
       }
     } catch (err) {
       console.error('Auth Error:', err);
       setError(
         err.response?.data?.message ||
-        (typeof err.response?.data === 'string' ? err.response.data : null) ||
-        'Authentication failed. Please verify your credentials and network connection.'
+          (typeof err.response?.data === 'string' ? err.response.data : null) ||
+          'Authentication failed. Please check your credentials and try again.'
       );
     } finally {
       setLoading(false);
     }
   };
 
+  const inputClass =
+    'w-full px-3.5 py-2.5 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
+
   return (
-    <div className="min-h-screen bg-violet-950 flex items-center justify-center p-4">
-      <div className="bg-white w-full max-w-md p-8 rounded-2xl shadow-2xl">
-        
-        {/* Header */}
-        <div className="text-center mb-6">
-          <div className="inline-block p-3 rounded-xl bg-violet-100 text-violet-700 font-black text-2xl mb-2">
-            BillStack
+    <div className="min-h-screen bg-sage-50 flex flex-col items-center justify-center px-4 py-10 font-sans text-stone-800">
+      <div className="w-full max-w-md bg-white border border-sage-200 rounded-xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-8">
+        <div className="mb-6">
+          <div className="flex items-center gap-2.5 mb-2">
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <span className="text-sm font-semibold tracking-tight text-sage-800">
+              BillStack
+            </span>
           </div>
-          <h2 className="text-2xl font-bold text-violet-950">
-            {isLogin ? 'Sign In to Your Portal' : 'Create Account'}
-          </h2>
-          <p className="text-violet-600 text-xs mt-1">
-            {isLogin
-              ? 'Provide your credentials and confirm your operational role'
-              : 'Register your institutional profile to access BillStack workflows'}
-          </p>
+          <h1 className="text-xl font-semibold text-stone-900 tracking-tight">
+            {loginMode === 'admin' ? 'Admin Sign In' : 'Sign In'}
+          </h1>
         </div>
 
-        {/* Error Alert */}
+        <div className="grid grid-cols-2 p-1 bg-sage-50 border border-sage-200/80 rounded-lg mb-6">
+          <button
+            type="button"
+            onClick={() => handleModeSwitch('user')}
+            className={`py-1.5 text-xs font-medium rounded-md transition cursor-pointer ${
+              loginMode === 'user'
+                ? 'bg-white text-sage-900 shadow-xs border border-sage-200/60'
+                : 'text-stone-500 hover:text-stone-700'
+            }`}
+          >
+            User Sign In
+          </button>
+          <button
+            type="button"
+            onClick={() => handleModeSwitch('admin')}
+            className={`py-1.5 text-xs font-medium rounded-md transition cursor-pointer ${
+              loginMode === 'admin'
+                ? 'bg-white text-sage-900 shadow-xs border border-sage-200/60'
+                : 'text-stone-500 hover:text-stone-700'
+            }`}
+          >
+            Admin Sign In
+          </button>
+        </div>
+
         {error && (
-          <div className="mb-4 p-3 bg-red-100 border border-red-300 text-red-700 text-xs rounded-lg font-medium">
+          <div className="mb-5 px-3.5 py-2.5 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-lg">
             {error}
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-3.5">
-          
-          {/* Sign Up Specific Fields */}
-          {!isLogin && (
-            <>
-              <div>
-                <label className="block text-xs font-bold text-violet-900 mb-1">Full Name</label>
-                <input
-                  type="text"
-                  name="name"
-                  placeholder="e.g., Aryan Sharma"
-                  value={formData.name}
-                  onChange={handleChange}
-                  required
-                  className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 focus:ring-2 focus:ring-violet-600 outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-violet-900 mb-1">
-                  {isStudentRole ? 'Roll Number / Enrollment ID' : 'Employee / Staff ID'}
-                </label>
-                <input
-                  type="text"
-                  name="institutionalId"
-                  placeholder={isStudentRole ? 'e.g., BT2026CS042' : 'e.g., EMP-FAC-101'}
-                  value={formData.institutionalId}
-                  onChange={handleChange}
-                  required
-                  className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 focus:ring-2 focus:ring-violet-600 outline-none"
-                />
-              </div>
-
-              {showDepartmentField && (
-                <div>
-                  <label className="block text-xs font-bold text-violet-900 mb-1">Department</label>
-                  <select
-                    name="department"
-                    value={formData.department}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 bg-white focus:ring-2 focus:ring-violet-600 outline-none"
-                  >
-                    {departments.map((dept) => (
-                      <option key={dept} value={dept}>{dept}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-            </>
-          )}
-
-          {/* Role Confirmation Selector (Present in both Login and Registration) */}
-          <div>
-            <label className="block text-xs font-bold text-violet-900 mb-1">
-              {isLogin ? 'Confirm Your Role' : 'Assign System Role'}
-            </label>
-            <select
-              name="role"
-              value={formData.role}
-              onChange={handleChange}
-              className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 bg-white focus:ring-2 focus:ring-violet-600 outline-none"
-            >
-              {roles.map((r) => (
-                <option key={r.value} value={r.value}>{r.label}</option>
-              ))}
-            </select>
-          </div>
-
-          {/* Username */}
-          <div>
-            <label className="block text-xs font-bold text-violet-900 mb-1">Username</label>
-            <input
-              type="text"
-              name="username"
-              placeholder="e.g., aryan_coord"
-              value={formData.username}
-              onChange={handleChange}
-              required
-              className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 focus:ring-2 focus:ring-violet-600 outline-none"
-            />
-          </div>
-
-          {/* Password */}
-          <div>
-            <label className="block text-xs font-bold text-violet-900 mb-1">Password</label>
-            <input
-              type="password"
-              name="password"
-              placeholder="••••••••"
-              value={formData.password}
-              onChange={handleChange}
-              required
-              className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 focus:ring-2 focus:ring-violet-600 outline-none"
-            />
-          </div>
-
-          {/* Confirm Password (Registration Only) */}
-          {!isLogin && (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {loginMode === 'user' && (
             <div>
-              <label className="block text-xs font-bold text-violet-900 mb-1">Confirm Password</label>
-              <input
-                type="password"
-                name="confirmPassword"
-                placeholder="••••••••"
-                value={formData.confirmPassword}
+              <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                Role
+              </label>
+              <select
+                name="role"
+                value={formData.role}
                 onChange={handleChange}
-                required
-                className="w-full px-3.5 py-2 border border-violet-200 rounded-lg text-sm text-slate-900 focus:ring-2 focus:ring-violet-600 outline-none"
-              />
+                className={inputClass}
+              >
+                {USER_ROLES.map((r) => (
+                  <option key={r.value} value={r.value}>
+                    {r.label}
+                  </option>
+                ))}
+              </select>
             </div>
           )}
 
-          {/* Submit Action */}
+          <div>
+            <label className="block text-xs font-medium text-stone-600 mb-1.5">
+              Username
+            </label>
+            <input
+              type="text"
+              name="username"
+              value={formData.username}
+              onChange={handleChange}
+              placeholder={
+                loginMode === 'admin'
+                  ? 'Enter admin username'
+                  : 'Enter your username'
+              }
+              required
+              className={inputClass}
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-stone-600 mb-1.5">
+              Password
+            </label>
+            <input
+              type="password"
+              name="password"
+              value={formData.password}
+              onChange={handleChange}
+              placeholder="••••••••"
+              required
+              className={inputClass}
+            />
+          </div>
+
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-violet-600 hover:bg-violet-700 disabled:bg-violet-400 text-white font-bold py-2.5 rounded-lg text-sm transition shadow-md mt-2 flex justify-center items-center"
+            className="w-full bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white font-medium py-2.5 rounded-lg text-sm transition mt-2 cursor-pointer disabled:cursor-not-allowed"
           >
-            {loading ? 'Processing...' : isLogin ? 'Sign In' : 'Create Account'}
+            {loading ? 'Signing in...' : 'Sign In'}
           </button>
         </form>
 
-        {/* Toggle Mode */}
-        <div className="text-center mt-5">
-          <p className="text-xs text-gray-600">
-            {isLogin ? "Don't have an account?" : 'Already registered?'}
-            <button
-              type="button"
-              onClick={() => {
-                setIsLogin(!isLogin);
-                setError('');
-              }}
-              className="ml-1.5 font-bold text-violet-700 hover:underline outline-none"
-            >
-              {isLogin ? 'Sign Up' : 'Log In'}
-            </button>
-          </p>
-        </div>
+        <p className="text-[11px] text-stone-400 mt-6 pt-4 border-t border-sage-100 text-center">
+          User accounts are provisioned by the system administrator.
+        </p>
       </div>
     </div>
   );

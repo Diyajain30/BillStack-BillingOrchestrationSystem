@@ -1,5 +1,6 @@
 package com.example.demo.controller;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -17,13 +18,15 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.demo.entity.AuditLog;
 import com.example.demo.entity.Bill;
+import com.example.demo.repository.AuditLogRepository;
 import com.example.demo.repository.BillRepository;
 import com.example.demo.repository.SubEventRepository;
 
 @RestController
 @RequestMapping("/api/bills")
-@CrossOrigin(origins = "http://localhost:3000")
+@CrossOrigin(origins = {"http://localhost:3000", "http://localhost:5173"})
 public class BillController {
 
     @Autowired
@@ -32,7 +35,35 @@ public class BillController {
     @Autowired
     private SubEventRepository subEventRepository;
 
-    // GET /api/bills - Scoped by subEventId query param
+    @Autowired
+    private AuditLogRepository auditLogRepository;
+
+    private boolean canOverrideOcr(String role) {
+        if (role == null) return false;
+        String r = role.trim().toUpperCase();
+        return "FACULTY".equals(r) || "FACULTY_HEAD".equals(r) || "MAIN_EVENT_HEAD".equals(r);
+    }
+
+    private Double parseDoubleSafe(Object val) {
+        if (val == null || val.toString().trim().isEmpty()) return null;
+        try {
+            return Double.valueOf(val.toString().trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private String resolvePreviousStage(String currentStatus) {
+        if (currentStatus == null) return "REJECTED";
+        return switch (currentStatus.trim().toUpperCase()) {
+            case "PENDING_STOREKEEPER" -> "PENDING_PRINCIPAL";
+            case "PENDING_PRINCIPAL" -> "PENDING_MAIN_HEAD";
+            case "PENDING_MAIN_HEAD" -> "PENDING_FACULTY";
+            case "PENDING_FACULTY" -> "REJECTED";
+            default -> "REJECTED";
+        };
+    }
+
     @GetMapping
     public ResponseEntity<List<Bill>> getAllBills(@RequestParam(required = false) Long subEventId) {
         List<Bill> all = billRepository.findAll();
@@ -45,34 +76,65 @@ public class BillController {
         return ResponseEntity.ok(all);
     }
 
-    // POST /api/bills - Attach subEventId and compute folder-specific running total
     @PostMapping
     public ResponseEntity<?> createBill(@RequestBody Bill bill) {
-        if (bill.getVendorName() == null || bill.getAmount() == null) {
-            return ResponseEntity.badRequest().body(Map.of("message", "Vendor name and amount are required."));
+        try {
+            if (bill.getVendorName() == null || bill.getVendorName().isBlank() || bill.getAmount() == null) {
+                return ResponseEntity.badRequest()
+                        .body(Map.of("message", "Vendor name and amount are required."));
+            }
+
+            if (bill.getBaseAmount() == null) bill.setBaseAmount(bill.getAmount());
+            if (bill.getCgst() == null) bill.setCgst(0.0);
+            if (bill.getSgst() == null) bill.setSgst(0.0);
+            if (bill.getVendorGstin() == null || bill.getVendorGstin().isBlank()) {
+                bill.setVendorGstin("Unregistered");
+            }
+
+            // Do not add pending bills to runningTotal or SubEvent totalSpent until fully APPROVED
+            bill.setRunningTotal(0.0);
+
+            String uploaderRole = bill.getUploadedByRole() != null
+                    ? bill.getUploadedByRole().trim().toUpperCase()
+                    : "STUDENT_COORDINATOR";
+            bill.setUploadedByRole(uploaderRole);
+
+            if (bill.getStatus() == null || bill.getStatus().isBlank()) {
+                if ("STUDENT_HEAD".equals(uploaderRole)) {
+                    bill.setStatus("PENDING_MAIN_HEAD");
+                } else {
+                    bill.setStatus("PENDING_FACULTY");
+                }
+            }
+
+            Bill saved = billRepository.save(bill);
+
+            try {
+                AuditLog log = new AuditLog();
+                log.setBillId(saved.getId());
+                log.setRole(uploaderRole);
+                log.setAction("STUDENT_HEAD".equals(uploaderRole)
+                        ? "Bill Submitted (Routed to Main Event Head)"
+                        : "Bill Submitted");
+                log.setRemark(saved.getDescription() != null && !saved.getDescription().isBlank()
+                        ? saved.getDescription()
+                        : "Initial upload and OCR extraction.");
+                log.setTimestamp(LocalDateTime.now());
+                auditLogRepository.save(log);
+            } catch (Exception logEx) {
+                System.err.println("AuditLog write skipped: " + logEx.getMessage());
+            }
+
+            updateSubEventSpending(saved.getSubEventId());
+
+            return ResponseEntity.status(HttpStatus.CREATED).body(saved);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "Failed to save bill: " + e.getMessage()));
         }
-
-        // Calculate running total strictly within this sub-event folder
-        List<Bill> existing = billRepository.findAll();
-        double folderRunningTotal = existing.stream()
-                .filter(b -> bill.getSubEventId() != null && bill.getSubEventId().equals(b.getSubEventId()))
-                .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
-                .sum();
-        bill.setRunningTotal(folderRunningTotal + bill.getAmount());
-
-        if (bill.getStatus() == null || bill.getStatus().isBlank()) {
-            bill.setStatus("PENDING_FACULTY");
-        }
-
-        Bill saved = billRepository.save(bill);
-
-        // Update SubEvent totalSpent
-        updateSubEventSpending(saved.getSubEventId());
-
-        return ResponseEntity.status(HttpStatus.CREATED).body(saved);
     }
 
-    // PUT /api/bills/{id}/status - Update bill status through approval pipeline or handle rejections
     @PutMapping("/{id}/status")
     public ResponseEntity<?> updateBillStatus(@PathVariable Long id, @RequestBody Map<String, Object> payload) {
         Optional<Bill> billOpt = billRepository.findById(id);
@@ -81,19 +143,72 @@ public class BillController {
         }
 
         Bill bill = billOpt.get();
+        String actorRole = payload.containsKey("role") && payload.get("role") != null
+                ? payload.get("role").toString().trim()
+                : "SYSTEM";
 
-        if (payload.containsKey("status")) {
-            String targetStatus = (String) payload.get("status");
+        String remarkStr = "";
+        if (payload.containsKey("remark") && payload.get("remark") != null) {
+            remarkStr = payload.get("remark").toString().trim();
+        }
 
-            if ("REJECTED".equalsIgnoreCase(targetStatus)) {
-                bill.setStatus("REJECTED");
-                if (payload.containsKey("rejectionReason")) {
-                    bill.setRejectionReason((String) payload.get("rejectionReason"));
-                }
-                if (payload.containsKey("rejectedBy")) {
-                    bill.setRejectedBy((String) payload.get("rejectedBy"));
-                }
-            } else if ("APPROVED".equalsIgnoreCase(targetStatus)) {
+        String targetStatus = payload.containsKey("status") && payload.get("status") != null
+                ? payload.get("status").toString().trim()
+                : "";
+
+        boolean isRejection = "REJECTED".equalsIgnoreCase(targetStatus)
+                || Boolean.TRUE.equals(payload.get("stepBack"));
+
+        if (isRejection && remarkStr.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("message", "A rejection remark is compulsory when rejecting a bill."));
+        }
+
+        // Allow OCR / receipt overrides for Faculty Head and Main Event Head
+        if (canOverrideOcr(actorRole)) {
+            if (payload.containsKey("vendorName") && payload.get("vendorName") != null) {
+                bill.setVendorName(payload.get("vendorName").toString().trim());
+            }
+            if (payload.containsKey("billNo") && payload.get("billNo") != null) {
+                bill.setBillNo(payload.get("billNo").toString().trim());
+            }
+            if (payload.containsKey("billDate") && payload.get("billDate") != null) {
+                bill.setBillDate(payload.get("billDate").toString().trim());
+            }
+            if (payload.containsKey("vendorGstin") && payload.get("vendorGstin") != null) {
+                bill.setVendorGstin(payload.get("vendorGstin").toString().trim());
+            }
+            if (payload.containsKey("receiptImage") && payload.get("receiptImage") != null
+                    && !payload.get("receiptImage").toString().isBlank()) {
+                bill.setReceiptImage(payload.get("receiptImage").toString());
+            }
+            Double amt = parseDoubleSafe(payload.get("amount"));
+            if (amt != null) bill.setAmount(amt);
+            Double base = parseDoubleSafe(payload.get("baseAmount"));
+            if (base != null) bill.setBaseAmount(base);
+            Double cgst = parseDoubleSafe(payload.get("cgst"));
+            if (cgst != null) bill.setCgst(cgst);
+            Double sgst = parseDoubleSafe(payload.get("sgst"));
+            if (sgst != null) bill.setSgst(sgst);
+        }
+
+        String logAction = "Status updated";
+
+        if (isRejection) {
+            String prevStage = resolvePreviousStage(bill.getStatus());
+            bill.setStatus(prevStage);
+            bill.setRunningTotal(0.0);
+            if (payload.containsKey("rejectionReason") && payload.get("rejectionReason") != null) {
+                bill.setRejectionReason(payload.get("rejectionReason").toString());
+            } else {
+                bill.setRejectionReason(remarkStr);
+            }
+            bill.setRejectedBy(payload.containsKey("rejectedBy") && payload.get("rejectedBy") != null
+                    ? payload.get("rejectedBy").toString()
+                    : actorRole);
+            logAction = "Rejected & stepped back to " + prevStage;
+        } else if (!targetStatus.isEmpty()) {
+            if ("APPROVED".equalsIgnoreCase(targetStatus)) {
                 String currentStatus = bill.getStatus();
                 if ("PENDING_FACULTY".equalsIgnoreCase(currentStatus)) {
                     bill.setStatus("PENDING_MAIN_HEAD");
@@ -106,73 +221,118 @@ public class BillController {
                 } else {
                     bill.setStatus("APPROVED");
                 }
+                bill.setRejectionReason(null);
+                bill.setRejectedBy(null);
+                logAction = "Approved & moved to " + bill.getStatus();
             } else {
                 bill.setStatus(targetStatus);
+                logAction = "Status updated to " + bill.getStatus();
             }
         }
 
-        // Editable fields sync (supports manual OCR overrides during review gates)
-        if (payload.containsKey("vendorName")) bill.setVendorName((String) payload.get("vendorName"));
-        if (payload.containsKey("billNo")) bill.setBillNo((String) payload.get("billNo"));
-        if (payload.containsKey("billDate")) bill.setBillDate((String) payload.get("billDate"));
-        if (payload.containsKey("vendorGstin")) bill.setVendorGstin((String) payload.get("vendorGstin"));
-        if (payload.containsKey("amount")) bill.setAmount(Double.valueOf(payload.get("amount").toString()));
-        if (payload.containsKey("baseAmount")) bill.setBaseAmount(Double.valueOf(payload.get("baseAmount").toString()));
-        if (payload.containsKey("cgst")) bill.setCgst(Double.valueOf(payload.get("cgst").toString()));
-        if (payload.containsKey("sgst")) bill.setSgst(Double.valueOf(payload.get("sgst").toString()));
-
-        if (payload.containsKey("remark")) {
-            String remark = (String) payload.get("remark");
+        if (!remarkStr.isEmpty()) {
             String existingDesc = bill.getDescription() != null ? bill.getDescription() : "";
-            bill.setDescription(existingDesc + " | Note: " + remark);
+            bill.setDescription(existingDesc.isEmpty()
+                    ? ("[" + actorRole + "] " + remarkStr)
+                    : (existingDesc + " | [" + actorRole + "] " + remarkStr));
+        }
+
+        // If the bill just reached final APPROVED status, compute its cumulative approved runningTotal
+        if ("APPROVED".equalsIgnoreCase(bill.getStatus()) && bill.getSubEventId() != null) {
+            double previousApproved = billRepository.findAll().stream()
+                    .filter(b -> bill.getSubEventId().equals(b.getSubEventId()))
+                    .filter(b -> !bill.getId().equals(b.getId()))
+                    .filter(b -> "APPROVED".equalsIgnoreCase(b.getStatus()))
+                    .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
+                    .sum();
+            bill.setRunningTotal(previousApproved + (bill.getAmount() != null ? bill.getAmount() : 0.0));
         }
 
         Bill updated = billRepository.save(bill);
 
-        // Recalculate SubEvent totalSpent
+        try {
+            AuditLog log = new AuditLog();
+            log.setBillId(updated.getId());
+            log.setRole(actorRole);
+            log.setAction(logAction);
+            log.setRemark(remarkStr.isEmpty() ? "Status advanced in pipeline." : remarkStr);
+            log.setTimestamp(LocalDateTime.now());
+            auditLogRepository.save(log);
+        } catch (Exception logEx) {
+            System.err.println("AuditLog write skipped: " + logEx.getMessage());
+        }
+
+        // Recalculate SubEvent totalSpent strictly from APPROVED bills
         updateSubEventSpending(updated.getSubEventId());
 
         return ResponseEntity.ok(updated);
     }
 
-    // PUT /api/bills/{id}/reupload - Student re-uploads/corrects a rejected bill
     @PutMapping("/{id}/reupload")
-    public ResponseEntity<?> reuploadBill(@PathVariable Long id, @RequestBody Bill updatedData) {
+    public ResponseEntity<?> reuploadBill(@PathVariable Long id, @RequestBody Map<String, Object> payload) {
         Optional<Bill> billOpt = billRepository.findById(id);
         if (billOpt.isEmpty()) {
             return ResponseEntity.notFound().build();
         }
 
         Bill bill = billOpt.get();
+        String remarkStr = payload.get("remark") != null ? payload.get("remark").toString().trim() : "";
+        if (remarkStr.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("message", "A resubmission remark is compulsory when re-uploading a bill."));
+        }
 
-        // Update details with re-uploaded info
-        if (updatedData.getVendorName() != null) bill.setVendorName(updatedData.getVendorName());
-        if (updatedData.getBillNo() != null) bill.setBillNo(updatedData.getBillNo());
-        if (updatedData.getAmount() != null) bill.setAmount(updatedData.getAmount());
-        if (updatedData.getBillDate() != null) bill.setBillDate(updatedData.getBillDate());
-       // if (updatedData.getBillImageUrl() != null) bill.setBillImageUrl(updatedData.getBillImageUrl());
+        if (payload.get("vendorName") != null) bill.setVendorName(payload.get("vendorName").toString());
+        if (payload.get("billNo") != null) bill.setBillNo(payload.get("billNo").toString());
+        Double amt = parseDoubleSafe(payload.get("amount"));
+        if (amt != null) bill.setAmount(amt);
+        if (payload.get("billDate") != null) bill.setBillDate(payload.get("billDate").toString());
+        if (payload.get("vendorGstin") != null) bill.setVendorGstin(payload.get("vendorGstin").toString());
+        Double base = parseDoubleSafe(payload.get("baseAmount"));
+        if (base != null) bill.setBaseAmount(base);
+        Double cgst = parseDoubleSafe(payload.get("cgst"));
+        if (cgst != null) bill.setCgst(cgst);
+        Double sgst = parseDoubleSafe(payload.get("sgst"));
+        if (sgst != null) bill.setSgst(sgst);
+        if (payload.get("description") != null) bill.setDescription(payload.get("description").toString());
+        if (payload.get("receiptImage") != null && !payload.get("receiptImage").toString().isBlank()) {
+            bill.setReceiptImage(payload.get("receiptImage").toString());
+        }
 
-        // Reset pipeline state back to Faculty review and clear rejection info
         bill.setStatus("PENDING_FACULTY");
+        bill.setRunningTotal(0.0);
         bill.setRejectionReason(null);
         bill.setRejectedBy(null);
 
         Bill saved = billRepository.save(bill);
+
+        try {
+            AuditLog log = new AuditLog();
+            log.setBillId(saved.getId());
+            log.setRole("STUDENT_COORDINATOR");
+            log.setAction("Bill Re-uploaded & Resubmitted");
+            log.setRemark(remarkStr);
+            log.setTimestamp(LocalDateTime.now());
+            auditLogRepository.save(log);
+        } catch (Exception logEx) {
+            System.err.println("AuditLog write skipped: " + logEx.getMessage());
+        }
+
         updateSubEventSpending(saved.getSubEventId());
 
         return ResponseEntity.ok(saved);
     }
 
-    // Helper method to recalculate sub-event spending
+    // Recalculate sub-event spending strictly from fully APPROVED bills
     private void updateSubEventSpending(Long subEventId) {
         if (subEventId != null) {
             subEventRepository.findById(subEventId).ifPresent(se -> {
-                double spent = billRepository.findAll().stream()
+                double approvedSpent = billRepository.findAll().stream()
                         .filter(b -> subEventId.equals(b.getSubEventId()))
-                        .filter(b -> !"REJECTED".equalsIgnoreCase(b.getStatus()))
+                        .filter(b -> "APPROVED".equalsIgnoreCase(b.getStatus()))
                         .mapToDouble(b -> b.getAmount() != null ? b.getAmount() : 0.0)
                         .sum();
-                se.setTotalSpent(spent);
+                se.setTotalSpent(approvedSpent);
                 subEventRepository.save(se);
             });
         }

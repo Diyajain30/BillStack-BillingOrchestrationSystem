@@ -1,430 +1,958 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { backendApi } from '../services/api';
+import AuditLogModal from './AuditLogModal';
+import ReceiptPreviewPane from './ReceiptPreviewPane';
+import { MasterEventAnalytics, SubEventAnalytics } from './AnalyticsCharts';
 
-export default function MainEventHeadDashboard({ currentUser }) {
+function formatDateDDMMYYYY(date = new Date()) {
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+function parseIdList(csvOrArray) {
+  if (!csvOrArray) return [];
+  if (Array.isArray(csvOrArray)) {
+    return csvOrArray
+      .map((v) => Number(String(v).trim()))
+      .filter((n) => Number.isFinite(n) && n > 0);
+  }
+  return String(csvOrArray)
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function getStatusBadgeClass(status) {
+  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
+  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+  return 'bg-amber-50 text-amber-800 border-amber-200';
+}
+
+export default function MainEventHeadDashboard({ user, onLogout }) {
+  const navigate = useNavigate();
+
+  // Always opens on the Overview page on login
+  const [activeTab, setActiveTab] = useState('overview');
   const [events, setEvents] = useState([]);
   const [bills, setBills] = useState([]);
-  
-  const [newMasterEvent, setNewMasterEvent] = useState({
-    wingName: 'Wings',
-    eventName: '',
-    allocatedBudget: ''
-  });
+  const [loading, setLoading] = useState(true);
+  const [feedback, setFeedback] = useState(null);
 
-  const [activeTab, setActiveTab] = useState('events');
+  // Folder inspector modal state
+  const [selectedFolder, setSelectedFolder] = useState(null);
+  const [folderDetail, setFolderDetail] = useState(null);
+  const [loadingFolder, setLoadingFolder] = useState(false);
 
-  // Rejection Modal State
+  // Bill Review & OCR Override modal state
+  const [selectedBill, setSelectedBill] = useState(null);
+  const [selectedBillForAudit, setSelectedBillForAudit] = useState(null);
+  const [editVendorName, setEditVendorName] = useState('');
+  const [editBillNo, setEditBillNo] = useState('');
+  const [editBillDate, setEditBillDate] = useState('');
+  const [editVendorGstin, setEditVendorGstin] = useState('');
+  const [editBaseAmount, setEditBaseAmount] = useState('');
+  const [editCgst, setEditCgst] = useState(0);
+  const [editSgst, setEditSgst] = useState(0);
+  const [editAmount, setEditAmount] = useState('');
+  const [reviewRemark, setReviewRemark] = useState('');
+
   const [showRejectModal, setShowRejectModal] = useState(false);
-  const [selectedBillId, setSelectedBillId] = useState(null);
   const [rejectionReason, setRejectionReason] = useState("Amount doesn't match the bill");
-  const [mainHeadRemark, setMainHeadRemark] = useState('');
+  const [rejectionRemark, setRejectionRemark] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
 
-  const MASTER_EVENT_CATEGORIES = ['Wings', 'Antarang', 'Lakshya'];
+  const todayStr = formatDateDDMMYYYY();
+  const currentUserId = Number(user?.id);
 
-  useEffect(() => {
-    fetchEvents();
-    fetchBills();
+  const showBanner = useCallback((type, text) => {
+    setFeedback({ type, text });
+    setTimeout(() => {
+      setFeedback((prev) => (prev?.text === text ? null : prev));
+    }, 4500);
   }, []);
 
-  const fetchEvents = async () => {
-    try {
-      const res = await fetch('http://localhost:8080/api/events');
-      if (res.ok) {
-        const data = await res.json();
-        setEvents(data);
-      }
-    } catch (err) {
-      console.error("Error fetching events:", err);
-    }
+  const handleSignOut = () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    if (typeof onLogout === 'function') onLogout();
+    navigate('/', { replace: true });
   };
 
-  const fetchBills = async () => {
+  // Shared across all Main Event Heads and Student Heads assigned to the Master Event(s)
+  const fetchDashboardData = useCallback(async () => {
+    setLoading(true);
     try {
-      const res = await fetch('http://localhost:8080/api/bills');
-      if (res.ok) {
-        const data = await res.json();
-        setBills(data);
-      }
-    } catch (err) {
-      console.error("Error fetching bills:", err);
-    }
-  };
+      const [eventsRes, billsRes] = await Promise.all([
+        backendApi.get('/subevents', {
+          params: {
+            userId: user?.id,
+            role: user?.role || 'MAIN_EVENT_HEAD',
+          },
+        }),
+        backendApi.get('/bills').catch(() => ({ data: [] })),
+      ]);
 
-  // 1. Create Master Event
-  const handleCreateMasterEvent = async (e) => {
-    e.preventDefault();
+      setEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
+      setBills(Array.isArray(billsRes.data) ? billsRes.data : []);
+    } catch (err) {
+      console.error('Failed to load Main Event Head data:', err);
+      showBanner('error', 'Failed to load assigned Master Event data.');
+    } finally {
+      setLoading(false);
+    }
+  }, [user?.id, user?.role, showBanner]);
+
+  useEffect(() => {
+    setActiveTab('overview');
+    fetchDashboardData();
+  }, [user?.id, fetchDashboardData]);
+
+  const assignedMasterEvents = useMemo(() => {
+    if (!Number.isFinite(currentUserId)) return [];
+    return events
+      .filter((ev) => {
+        if (ev.parentEventId != null) return false;
+        const mainHeadList = parseIdList(ev.mainHeadIds);
+        const isMain =
+          (ev.mainHeadId != null && Number(ev.mainHeadId) === currentUserId) ||
+          mainHeadList.includes(currentUserId);
+        const isStudentHead = parseIdList(ev.studentHeadIds).includes(currentUserId);
+        return isMain || isStudentHead;
+      })
+      .sort((a, b) => (Number(b.eventYear) || 0) - (Number(a.eventYear) || 0));
+  }, [events, currentUserId]);
+
+  const assignedMasterIds = useMemo(
+    () => new Set(assignedMasterEvents.map((m) => Number(m.id))),
+    [assignedMasterEvents]
+  );
+
+  const scopedSubEvents = useMemo(() => {
+    return events.filter(
+      (ev) => ev.parentEventId != null && assignedMasterIds.has(Number(ev.parentEventId))
+    );
+  }, [events, assignedMasterIds]);
+
+  const scopedSubEventIds = useMemo(
+    () => new Set(scopedSubEvents.map((se) => Number(se.id))),
+    [scopedSubEvents]
+  );
+
+  const scopedBills = useMemo(() => {
+    return bills.filter((b) => {
+      const subId = b.subEventId ?? b.sub_event_id ?? b.eventId ?? b.event_id;
+      return subId != null && scopedSubEventIds.has(Number(subId));
+    });
+  }, [bills, scopedSubEventIds]);
+
+  const pendingMainHeadBills = useMemo(
+    () => scopedBills.filter((b) => b.status === 'PENDING_MAIN_HEAD'),
+    [scopedBills]
+  );
+
+  // Dynamic totals calculated strictly from fully APPROVED bills
+  const totals = useMemo(() => {
+    const budget = scopedSubEvents.reduce((sum, se) => sum + (Number(se.budgetCap) || 0), 0);
+    const spent = scopedBills
+      .filter((b) => b.status === 'APPROVED')
+      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+    const advance = scopedSubEvents.reduce(
+      (sum, se) => sum + (Number(se.advanceDisbursed) || 0),
+      0
+    );
+    return { budget, spent, advance };
+  }, [scopedSubEvents, scopedBills]);
+
+  const getApprovedSpentForSubEvent = (subEventId) =>
+    scopedBills
+      .filter((b) => Number(b.subEventId) === Number(subEventId) && b.status === 'APPROVED')
+      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+
+  const handleOpenFolder = async (subEvent) => {
+    setSelectedFolder(subEvent);
+    setFolderDetail(null);
+    setLoadingFolder(true);
     try {
-      const res = await fetch('http://localhost:8080/api/events', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wingName: newMasterEvent.wingName,
-          name: newMasterEvent.eventName.trim() !== '' ? newMasterEvent.eventName : (newMasterEvent.wingName + ' Master'),
-          department: null,
-          budgetCap: parseFloat(newMasterEvent.allocatedBudget),
-          parentEventId: null,
-          mainHeadId: currentUser?.id || 1,
-          status: 'ACTIVE'
-        })
+      const res = await backendApi.get(`/subevents/${subEvent.id}`, {
+        params: {
+          userId: user?.id,
+          role: user?.role || 'MAIN_EVENT_HEAD',
+        },
       });
-      if (res.ok) {
-        alert('Master Event initiated successfully!');
-        setNewMasterEvent({ wingName: 'Wings', eventName: '', allocatedBudget: '' });
-        fetchEvents();
-      }
+      setFolderDetail(res.data);
     } catch (err) {
-      console.error("Error creating master event:", err);
+      console.error('Failed to inspect sub-event folder:', err);
+      showBanner('error', err.response?.data?.message || 'Unable to open folder.');
+      setSelectedFolder(null);
+    } finally {
+      setLoadingFolder(false);
     }
   };
 
-  // 2. Close Master Event Lifecycle (Removes it from UI view)
-  const handleCloseEvent = async (eventId) => {
-    const eventToClose = events.find(ev => ev.id === eventId);
-    if (!eventToClose) return;
-
-    if (!window.confirm(`Are you sure you want to close "${eventToClose.name || eventToClose.wingName}"? This will close the event and remove it from the active UI.`)) {
-      return;
-    }
-
-    try {
-      const res = await fetch(`http://localhost:8080/api/events/${eventId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...eventToClose,
-          status: 'CLOSED'
-        })
-      });
-      if (res.ok) {
-        alert('Event closed successfully and removed from active view!');
-        fetchEvents();
-      }
-    } catch (err) {
-      console.error("Error closing event:", err);
-    }
+  const handleOpenReview = (bill) => {
+    setSelectedBill(bill);
+    setEditVendorName(bill.vendorName || '');
+    setEditBillNo(bill.billNo || '');
+    setEditBillDate(bill.billDate || '');
+    setEditVendorGstin(bill.vendorGstin || '');
+    setEditBaseAmount(bill.baseAmount ?? bill.amount ?? '');
+    setEditCgst(bill.cgst ?? 0);
+    setEditSgst(bill.sgst ?? 0);
+    setEditAmount(bill.amount ?? '');
+    setReviewRemark('');
+    setRejectionRemark('');
   };
 
-  // 3. Main Event Head Approval Action
-  const handleBillAction = async (billId, action) => {
-    if (action === 'REJECTED') {
-      setSelectedBillId(billId);
-      setShowRejectModal(true);
-      return;
-    }
+  const closeReviewModals = () => {
+    setSelectedBill(null);
+    setShowRejectModal(false);
+    setReviewRemark('');
+    setRejectionRemark('');
+    setRejectionReason("Amount doesn't match the bill");
+  };
 
+  const handleApproveBill = async () => {
+    if (!selectedBill) return;
+    setActionLoading(true);
     try {
-      setActionLoading(true);
-      const res = await fetch(`http://localhost:8080/api/bills/${billId}/status`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'APPROVED' }) // Triggers PENDING_MAIN_HEAD -> PENDING_PRINCIPAL progression
+      await backendApi.put(`/bills/${selectedBill.id}/status`, {
+        status: 'APPROVED',
+        role: 'MAIN_EVENT_HEAD',
+        actorId: user?.id,
+        remark: reviewRemark || 'Verified and forwarded by Main Event Head',
+        vendorName: editVendorName,
+        billNo: editBillNo,
+        billDate: editBillDate,
+        vendorGstin: editVendorGstin,
+        baseAmount: parseFloat(editBaseAmount) || selectedBill.baseAmount,
+        cgst: parseFloat(editCgst) || 0,
+        sgst: parseFloat(editSgst) || 0,
+        amount: parseFloat(editAmount) || selectedBill.amount,
       });
-      if (res.ok) {
-        alert('Bill successfully approved and forwarded to Principal!');
-        fetchBills();
-      }
+      showBanner(
+        'success',
+        `Bill #${editBillNo || selectedBill.billNo} approved and forwarded to Principal.`
+      );
+      closeReviewModals();
+      await fetchDashboardData();
     } catch (err) {
-      console.error("Error updating bill status:", err);
+      showBanner('error', err.response?.data?.message || 'Failed to approve bill.');
     } finally {
       setActionLoading(false);
     }
   };
 
-  // 4. Confirm Rejection with Reason
+  // Step-back rejection loop: compulsory remark, steps back to previous stage (Faculty or Coordinator)
   const handleConfirmReject = async () => {
-    if (!selectedBillId) return;
+    if (!selectedBill) return;
+    if (!rejectionRemark.trim()) {
+      showBanner(
+        'error',
+        'A rejection remark is compulsory when rejecting a bill.'
+      );
+      return;
+    }
+
+    setActionLoading(true);
     try {
-      setActionLoading(true);
-      const res = await fetch(`http://localhost:8080/api/bills/${selectedBillId}/status`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          status: 'REJECTED',
-          rejectionReason: rejectionReason,
-          remark: mainHeadRemark || 'Rejected by Main Event Head',
-          rejectedBy: 'MAIN_EVENT_HEAD'
-        })
+      await backendApi.put(`/bills/${selectedBill.id}/status`, {
+        status: 'REJECTED',
+        stepBack: true,
+        role: 'MAIN_EVENT_HEAD',
+        actorId: user?.id,
+        remark: rejectionRemark.trim(),
+        rejectionReason,
+        rejectedBy: 'MAIN_EVENT_HEAD',
       });
-      if (res.ok) {
-        alert('Bill successfully rejected and returned to coordinator for correction!');
-        setShowRejectModal(false);
-        setSelectedBillId(null);
-        setMainHeadRemark('');
-        setRejectionReason("Amount doesn't match the bill");
-        fetchBills();
-      }
+      showBanner(
+        'success',
+        `Bill #${selectedBill.billNo || selectedBill.id} rejected and stepped back with compulsory remark.`
+      );
+      closeReviewModals();
+      await fetchDashboardData();
     } catch (err) {
-      console.error("Error rejecting bill:", err);
+      showBanner('error', err.response?.data?.message || 'Failed to reject bill.');
     } finally {
       setActionLoading(false);
     }
   };
 
-  const pendingBills = bills.filter(b => b.status === 'PENDING_MAIN_HEAD');
-  
-  // Master events filter: parentEventId is null, and exclude closed events from UI display
-  const activeMasterEvents = events.filter(ev => (ev.parentEventId === null || ev.parentEventId === undefined) && ev.status !== 'CLOSED');
-  const allSubEvents = events.filter(ev => ev.parentEventId !== null && ev.parentEventId !== undefined);
+  const folderBills = useMemo(() => {
+    if (!selectedFolder) return [];
+    return scopedBills.filter((b) => {
+      const subId = b.subEventId ?? b.sub_event_id ?? b.eventId ?? b.event_id;
+      return Number(subId) === Number(selectedFolder.id);
+    });
+  }, [scopedBills, selectedFolder]);
+
+  const inputClass =
+    'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition disabled:bg-sage-50 disabled:text-stone-600';
+
+  const navItems = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'pending', label: 'Pending Approvals', count: pendingMainHeadBills.length },
+    { id: 'all', label: 'All Scoped Bills', count: scopedBills.length },
+    { id: 'folders', label: 'Sub-Event Folders', count: scopedSubEvents.length },
+    { id: 'profile', label: 'Profile' },
+  ];
+
+  const displayedBills = activeTab === 'pending' ? pendingMainHeadBills : scopedBills;
+  const isPendingMainHead = selectedBill?.status === 'PENDING_MAIN_HEAD';
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
-      <div className="flex justify-between items-center bg-violet-900 text-white p-6 rounded-2xl shadow-xl">
-        <div>
-          <h1 className="text-3xl font-black tracking-tight">Main Event Head Control Center</h1>
-          <p className="text-violet-200 text-sm mt-1">Overseeing Master Festival Events, Lifecycle Closure & Bill Approvals</p>
-        </div>
-        <div className="bg-violet-800 px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider border border-violet-700">
-          Role: Main Event Head
-        </div>
-      </div>
-
-      {/* Navigation Tabs */}
-      <div className="flex space-x-2 border-b border-slate-200 pb-2">
-        <button 
-          onClick={() => setActiveTab('events')} 
-          className={`px-5 py-2.5 font-bold rounded-xl text-sm transition ${activeTab === 'events' ? 'bg-violet-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}
-        >
-          Master Events Management
-        </button>
-        <button 
-          onClick={() => setActiveTab('approvals')} 
-          className={`px-5 py-2.5 font-bold rounded-xl text-sm transition flex items-center gap-2 ${activeTab === 'approvals' ? 'bg-violet-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}
-        >
-          Bill Approvals
-          {pendingBills.length > 0 && (
-            <span className="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full font-black">
-              {pendingBills.length}
-            </span>
-          )}
-        </button>
-      </div>
-
-      {/* TAB 1: MASTER EVENTS MANAGEMENT & LIFECYCLE */}
-      {activeTab === 'events' && (
-        <div className="space-y-6">
-          
-          {/* Create Master Event Form */}
-          <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100 max-w-2xl mx-auto space-y-4">
-            <h2 className="text-xl font-black text-violet-950">Initiate Master Event</h2>
-            <p className="text-xs text-slate-500">Create overarching festival master containers. Sub-events will be managed independently by Student Heads.</p>
-            
-            <form onSubmit={handleCreateMasterEvent} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">Select Master Category</label>
-                <select 
-                  value={newMasterEvent.wingName} 
-                  onChange={e => setNewMasterEvent({...newMasterEvent, wingName: e.target.value})}
-                  className="w-full p-3 border-2 border-slate-200 rounded-xl font-bold text-slate-800 bg-white outline-none focus:border-violet-600 text-sm"
-                  required
-                >
-                  {MASTER_EVENT_CATEGORIES.map(category => (
-                    <option key={category} value={category}>{category}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">Master Event Name / Title</label>
-                <input 
-                  type="text" 
-                  value={newMasterEvent.eventName} 
-                  onChange={e => setNewMasterEvent({...newMasterEvent, eventName: e.target.value})}
-                  className="w-full p-3 border-2 border-slate-200 rounded-xl font-semibold text-slate-800 outline-none focus:border-violet-600 text-sm" 
-                  placeholder="e.g., Annual Tech Fest 2026 (Helps avoid ID confusion)"
-                  required 
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">Master Event Budget Cap (₹)</label>
-                <input 
-                  type="number" 
-                  value={newMasterEvent.allocatedBudget} 
-                  onChange={e => setNewMasterEvent({...newMasterEvent, allocatedBudget: e.target.value})}
-                  className="w-full p-3 border-2 border-slate-200 rounded-xl font-semibold text-slate-800 outline-none focus:border-violet-600 text-sm" 
-                  placeholder="e.g., 150000"
-                  required 
-                />
-              </div>
-
-              <button type="submit" className="w-full bg-violet-600 text-white py-3 rounded-xl font-bold hover:bg-violet-700 transition shadow-md">
-                Create Master Event
-              </button>
-            </form>
+    <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
+      <header className="bg-white border-b border-sage-200 sticky top-0 z-30">
+        <div className="px-6 py-3.5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-sage-900">BillStack</span>
+              <span className="text-stone-300">/</span>
+              <h1 className="text-sm font-medium text-stone-700">Main Event Head Portal</h1>
+            </div>
           </div>
 
-          {/* Active Master Events & Lifecycle Control */}
-          <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100">
-            <h2 className="text-xl font-black text-violet-950 mb-2">Active Master Events Overview</h2>
-            <p className="text-xs text-slate-500 mb-6">Monitor active master events and their student-head created sub-events. Closing an event removes it from this active view.</p>
-            
-            {activeMasterEvents.length === 0 ? (
-              <p className="text-slate-500 text-sm italic py-8 text-center">No active master events currently running.</p>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {activeMasterEvents.map(master => {
-                  const linkedSubEvents = allSubEvents.filter(sub => Number(sub.parentEventId) === Number(master.id));
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-medium text-stone-800 hidden sm:inline">
+              {user?.name || user?.username}
+            </span>
+            <button
+              type="button"
+              onClick={fetchDashboardData}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Refresh
+            </button>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </header>
 
-                  return (
-                    <div key={master.id} className="border-2 border-violet-200 bg-violet-50/40 rounded-2xl p-5 space-y-4">
-                      <div className="flex justify-between items-start">
-                        <div>
-                          <span className="text-xs font-bold uppercase tracking-wider text-violet-600">Category: {master.wingName}</span>
-                          <h3 className="text-lg font-black text-slate-900 mt-0.5">{master.name}</h3>
-                          <span className="text-[11px] font-mono text-slate-500">Database ID: #{master.id}</span>
-                        </div>
-                        <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">
-                          ACTIVE
-                        </span>
-                      </div>
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 bg-white border-r border-sage-200 p-4 shrink-0 hidden md:block">
+          <nav className="space-y-1.5">
+            {navItems.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
+                  activeTab === tab.id
+                    ? 'bg-sage-100 text-sage-900 border border-sage-200'
+                    : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
+                }`}
+              >
+                <span>{tab.label}</span>
+                {tab.count !== undefined && (
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-md border ${
+                      tab.id === 'pending' && tab.count > 0
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-white text-stone-600 border-sage-200'
+                    }`}
+                  >
+                    {tab.count}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </aside>
 
-                      <div className="text-sm font-semibold text-slate-700">
-                        <p>Budget Cap: <span className="font-black text-slate-900">₹{master.budgetCap}</span></p>
-                      </div>
-
-                      {/* Student-Head Created Sub-Events list */}
-                      <div className="space-y-2">
-                        <h4 className="text-xs font-black uppercase text-slate-500 tracking-wider">Sub-Events ({linkedSubEvents.length})</h4>
-                        {linkedSubEvents.length === 0 ? (
-                          <p className="text-xs text-slate-400 italic">No sub-events created yet.</p>
-                        ) : (
-                          <ul className="space-y-1.5 max-h-32 overflow-y-auto">
-                            {linkedSubEvents.map(sub => (
-                              <li key={sub.id} className="bg-white p-2 rounded-xl border border-slate-200 text-xs flex justify-between items-center">
-                                <span className="font-bold text-slate-800">{sub.name}</span>
-                                <span className="text-violet-700 font-semibold text-[10px] bg-violet-100 px-2 py-0.5 rounded-md">{sub.department}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-
-                      {/* Close Event Lifecycle Action */}
-                      <button 
-                        onClick={() => handleCloseEvent(master.id)}
-                        className="w-full bg-rose-600 text-white py-2 rounded-xl text-xs font-bold hover:bg-rose-700 transition shadow"
-                      >
-                        Close Event 
-                      </button>
-                    </div>
-                  );
-                })}
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto min-w-0">
+          <div className="max-w-6xl mx-auto space-y-6">
+            {feedback && (
+              <div
+                className={`px-4 py-3 rounded-lg text-xs font-medium border ${
+                  feedback.type === 'success'
+                    ? 'bg-sage-100 text-sage-900 border-sage-200'
+                    : 'bg-rose-50 text-rose-700 border-rose-200'
+                }`}
+              >
+                {feedback.text}
               </div>
+            )}
+
+            {loading ? (
+              <div className="text-sm text-stone-500">Loading assigned Master Events...</div>
+            ) : assignedMasterEvents.length === 0 ? (
+              <div className="bg-white border border-sage-200 rounded-xl p-6 text-sm text-stone-600">
+                No Master Event is assigned to your account yet. Once an Admin assigns you to a Master Event, its sub-events and bills will appear here.
+              </div>
+            ) : (
+              <>
+                <div className="bg-white border border-sage-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-stone-400 font-semibold">
+                      Scoped Master Event(s)
+                    </div>
+                    <div className="text-base font-semibold text-stone-900 mt-0.5">
+                      {assignedMasterEvents
+                        .map((m) => `${m.name}${m.eventYear ? ` (${m.eventYear})` : ''}`)
+                        .join(', ')}
+                    </div>
+                  </div>
+                  <div className="text-xs text-stone-500">
+                    Date: {todayStr} &middot; {scopedSubEvents.length} Sub-Event
+                    {scopedSubEvents.length === 1 ? '' : 's'}
+                  </div>
+                </div>
+
+                {activeTab === 'overview' && (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <div className="bg-white border border-sage-200 rounded-xl p-5">
+                        <div className="text-xs text-stone-500">Scoped Budget Cap</div>
+                        <div className="text-2xl font-semibold text-stone-900 mt-1.5">
+                          INR {totals.budget.toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                      <div className="bg-white border border-sage-200 rounded-xl p-5">
+                        <div className="text-xs text-stone-500">Approved Expenditure</div>
+                        <div className="text-2xl font-semibold text-sage-800 mt-1.5">
+                          INR {totals.spent.toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                      <div className="bg-white border border-sage-200 rounded-xl p-5">
+                        <div className="text-xs text-stone-500">Remaining Balance</div>
+                        <div className="text-2xl font-semibold text-stone-900 mt-1.5">
+                          INR {(totals.budget - totals.spent).toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                      <div className="bg-white border border-sage-200 rounded-xl p-5">
+                        <div className="text-xs text-stone-500">Advance Disbursed</div>
+                        <div className="text-2xl font-semibold text-stone-900 mt-1.5">
+                          INR {totals.advance.toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                    </div>
+
+                    <MasterEventAnalytics
+                      masterEvents={assignedMasterEvents}
+                      subEvents={scopedSubEvents}
+                      bills={scopedBills}
+                    />
+                  </div>
+                )}
+
+                {(activeTab === 'pending' || activeTab === 'all') && (
+                  <section className="bg-white p-6 rounded-xl border border-sage-200 space-y-4">
+                    <div className="flex items-center justify-between pb-3 border-b border-sage-100">
+                      <h2 className="text-base font-semibold text-stone-900">
+                        {activeTab === 'pending'
+                          ? `Pending Main Event Head Review (${pendingMainHeadBills.length})`
+                          : `All Scoped Bills (${scopedBills.length})`}
+                      </h2>
+                    </div>
+
+                    {displayedBills.length === 0 ? (
+                      <div className="py-10 text-center text-xs text-stone-500 bg-sage-50/50 border border-sage-200/80 rounded-lg">
+                        No bills found in this view.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                        <table className="w-full text-left text-sm border-collapse">
+                          <thead>
+                            <tr className="bg-sage-50 text-stone-600 text-xs font-medium border-b border-sage-200">
+                              <th className="py-3 px-4">Bill No</th>
+                              <th className="py-3 px-4">Vendor &amp; Sub-Event</th>
+                              <th className="py-3 px-4">Amount</th>
+                              <th className="py-3 px-4">Date</th>
+                              <th className="py-3 px-4">Status</th>
+                              <th className="py-3 px-4 text-center">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-sage-100">
+                            {displayedBills.map((bill) => (
+                              <tr key={bill.id} className="hover:bg-sage-50/50">
+                                <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                                  {bill.billNo || bill.id}
+                                </td>
+                                <td className="py-3 px-4">
+                                  <span className="font-medium text-stone-900 block">
+                                    {bill.vendorName}
+                                  </span>
+                                  <span className="text-xs text-stone-500">
+                                    {bill.eventName || 'Sub-Event'}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-4 font-medium text-stone-900">
+                                  INR {Number(bill.amount || 0).toFixed(2)}
+                                </td>
+                                <td className="py-3 px-4 text-xs text-stone-500">
+                                  {bill.billDate || 'N/A'}
+                                </td>
+                                <td className="py-3 px-4">
+                                  <span
+                                    className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
+                                      bill.status
+                                    )}`}
+                                  >
+                                    {bill.status}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-4 text-center">
+                                  <div className="inline-flex items-center gap-2">
+                                    <button
+                                      onClick={() => handleOpenReview(bill)}
+                                      className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium transition cursor-pointer"
+                                    >
+                                      {bill.status === 'PENDING_MAIN_HEAD'
+                                        ? 'Review & Edit'
+                                        : 'View'}
+                                    </button>
+                                    <button
+                                      onClick={() => setSelectedBillForAudit(bill.id)}
+                                      className="px-2.5 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                    >
+                                      Logs
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                )}
+
+                {activeTab === 'folders' && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {scopedSubEvents.length === 0 ? (
+                      <div className="col-span-full bg-white border border-sage-200 rounded-xl p-6 text-sm text-stone-500">
+                        No sub-events created under your Master Event(s) yet. Student Heads create sub-events from their portal.
+                      </div>
+                    ) : (
+                      scopedSubEvents.map((se) => {
+                        const approvedSpent = getApprovedSpentForSubEvent(se.id);
+                        return (
+                          <div
+                            key={se.id}
+                            className="bg-white border border-sage-200 rounded-xl p-5 flex flex-col justify-between gap-4"
+                          >
+                            <div>
+                              <div className="flex items-start justify-between gap-2">
+                                <h3 className="font-semibold text-stone-900">{se.name}</h3>
+                                <span className="text-[11px] px-2 py-0.5 rounded bg-sage-50 border border-sage-200 text-sage-800 font-medium">
+                                  {se.status || 'OPEN'}
+                                </span>
+                              </div>
+                              <p className="text-xs text-stone-500 mt-1">
+                                {se.department || 'General'}
+                              </p>
+                              <div className="mt-3 text-xs text-stone-700 flex justify-between">
+                                <span>
+                                  Approved Spend: INR {approvedSpent.toLocaleString('en-IN')}
+                                </span>
+                                <span>
+                                  Cap: INR {(Number(se.budgetCap) || 0).toLocaleString('en-IN')}
+                                </span>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => handleOpenFolder(se)}
+                              className="w-full py-2 text-xs font-medium rounded-lg bg-white hover:bg-sage-50 border border-sage-200 text-sage-800 cursor-pointer"
+                            >
+                              Open Folder
+                            </button>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+
+                {activeTab === 'profile' && (
+                  <section className="bg-white border border-sage-200 rounded-xl p-6 max-w-lg space-y-3 text-sm">
+                    <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                      Profile
+                    </h2>
+                    <div className="flex justify-between py-2 border-b border-sage-100">
+                      <span className="text-stone-500">Name</span>
+                      <span className="font-medium text-stone-900">{user?.name || '—'}</span>
+                    </div>
+                    <div className="flex justify-between py-2 border-b border-sage-100">
+                      <span className="text-stone-500">Username</span>
+                      <span className="font-mono text-stone-800">{user?.username || '—'}</span>
+                    </div>
+                    <div className="flex justify-between py-2 border-b border-sage-100">
+                      <span className="text-stone-500">Department</span>
+                      <span className="text-stone-800">{user?.department || '—'}</span>
+                    </div>
+                    <div className="flex justify-between py-2">
+                      <span className="text-stone-500">Institutional ID</span>
+                      <span className="font-mono text-stone-800">
+                        {user?.institutionalId || '—'}
+                      </span>
+                    </div>
+                  </section>
+                )}
+              </>
+            )}
+          </div>
+        </main>
+      </div>
+
+      {/* FOLDER INSPECTOR MODAL */}
+      {selectedFolder && (
+        <div className="fixed inset-0 bg-stone-900/40 flex items-center justify-center p-4 z-40">
+          <div className="bg-white border border-sage-200 rounded-xl max-w-5xl w-full max-h-[88vh] overflow-y-auto p-6 space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b border-sage-100">
+              <h3 className="text-base font-semibold text-stone-900">
+                Folder: {selectedFolder.name}
+              </h3>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedFolder(null);
+                  setFolderDetail(null);
+                }}
+                className="text-xs font-medium text-stone-500 hover:text-stone-800 cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+
+            {loadingFolder ? (
+              <p className="text-xs text-stone-500">Loading folder details...</p>
+            ) : (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs bg-sage-50/60 p-4 rounded-lg border border-sage-100">
+                  <div>
+                    <div className="font-semibold text-stone-700 mb-1">
+                      Assigned Coordinators
+                    </div>
+                    {folderDetail?.coordinators?.length
+                      ? folderDetail.coordinators
+                          .map((c) => `${c.name} (${c.username})`)
+                          .join(', ')
+                      : 'None assigned'}
+                  </div>
+                  <div>
+                    <div className="font-semibold text-stone-700 mb-1">
+                      Assigned Faculty Heads
+                    </div>
+                    {folderDetail?.facultyHeads?.length
+                      ? folderDetail.facultyHeads
+                          .map((f) => `${f.name} (${f.username})`)
+                          .join(', ')
+                      : 'None assigned'}
+                  </div>
+                </div>
+
+                <SubEventAnalytics
+                  allocatedBudget={Number(selectedFolder.budgetCap) || 0}
+                  bills={folderBills}
+                />
+
+                <div className="space-y-2">
+                  <div className="font-semibold text-sm text-stone-800">
+                    Bills in Folder ({folderBills.length})
+                  </div>
+                  {folderBills.length === 0 ? (
+                    <p className="text-xs text-stone-500">No bills linked to this folder.</p>
+                  ) : (
+                    <div className="border border-sage-200 rounded-lg divide-y divide-sage-100 text-xs">
+                      {folderBills.map((b) => (
+                        <div
+                          key={b.id}
+                          className="p-3 flex items-center justify-between gap-3"
+                        >
+                          <div>
+                            <div className="font-medium text-stone-900">
+                              {b.vendorName}{' '}
+                              <span className="font-mono text-stone-500">
+                                #{b.billNo || b.id}
+                              </span>
+                            </div>
+                            <div className="text-stone-500">Status: {b.status}</div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="font-semibold text-stone-900">
+                              INR {Number(b.amount || 0).toLocaleString('en-IN')}
+                            </span>
+                            <button
+                              onClick={() => handleOpenReview(b)}
+                              className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded text-xs font-medium cursor-pointer"
+                            >
+                              {b.status === 'PENDING_MAIN_HEAD' ? 'Review' : 'View'}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
             )}
           </div>
         </div>
       )}
 
-      {/* TAB 2: BILL APPROVALS */}
-      {activeTab === 'approvals' && (
-        <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100">
-          <h2 className="text-xl font-black text-violet-950 mb-4">Bills Awaiting Main Event Head Review</h2>
-          {pendingBills.length === 0 ? (
-            <p className="text-slate-500 text-sm italic py-8 text-center">No bills currently pending your review in the conveyor belt.</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-xs font-black text-slate-500 uppercase tracking-wider">
-                    <th className="p-3">Bill ID</th>
-                    <th className="p-3">Vendor</th>
-                    <th className="p-3">Amount</th>
-                    <th className="p-3">Status</th>
-                    <th className="p-3 text-center">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 text-sm">
-                  {pendingBills.map(bill => (
-                    <tr key={bill.billId || bill.id} className="hover:bg-slate-50 transition">
-                      <td className="p-3 font-mono font-bold text-violet-900">#{bill.billId || bill.id}</td>
-                      <td className="p-3 font-semibold text-slate-800">{bill.vendorName}</td>
-                      <td className="p-3 font-black text-slate-900">₹{bill.amount}</td>
-                      <td className="p-3">
-                        <span className="px-2.5 py-1 bg-amber-100 text-amber-800 rounded-lg text-xs font-bold">
-                          {bill.status}
-                        </span>
-                      </td>
-                      <td className="p-3 text-center space-x-2">
-                        <button 
-                          onClick={() => handleBillAction(bill.billId || bill.id, 'APPROVED')} 
-                          className="bg-emerald-600 text-white px-4 py-1.5 rounded-xl text-xs font-bold hover:bg-emerald-700 transition shadow"
-                        >
-                          Approve
-                        </button>
-                        <button 
-                          onClick={() => handleBillAction(bill.billId || bill.id, 'REJECTED')} 
-                          className="bg-rose-600 text-white px-4 py-1.5 rounded-xl text-xs font-bold hover:bg-rose-700 transition shadow"
-                        >
-                          Reject
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+      {/* SIDE-BY-SIDE BILL REVIEW & OCR OVERRIDE MODAL */}
+      {selectedBill && !showRejectModal && (
+        <div className="fixed inset-0 bg-stone-900/45 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white w-full max-w-5xl rounded-xl border border-sage-200 shadow-lg overflow-hidden flex flex-col max-h-[92vh]">
+            <div className="px-6 py-4 border-b border-sage-100 flex justify-between items-center bg-sage-50/60">
+              <div>
+                <h3 className="text-base font-semibold text-stone-900">
+                  Main Event Head Review &amp; OCR Verification
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Verify the scanned bill side-by-side and override OCR details if needed before forwarding to Principal.
+                </p>
+              </div>
+              <button
+                onClick={closeReviewModals}
+                className="px-2.5 py-1 text-xs font-medium text-stone-500 hover:text-stone-800 hover:bg-sage-100 rounded-md cursor-pointer"
+              >
+                Close
+              </button>
             </div>
-          )}
+
+            <div className="p-6 overflow-y-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-6">
+                <ReceiptPreviewPane
+                  receiptImage={selectedBill.receiptImage}
+                  billNo={selectedBill.billNo || selectedBill.id}
+                />
+              </div>
+
+              <div className="lg:col-span-6 space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Vendor Name
+                    </label>
+                    <input
+                      type="text"
+                      value={editVendorName}
+                      onChange={(e) => setEditVendorName(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Invoice Number
+                    </label>
+                    <input
+                      type="text"
+                      value={editBillNo}
+                      onChange={(e) => setEditBillNo(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={`${inputClass} font-mono`}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Bill Date
+                    </label>
+                    <input
+                      type="text"
+                      value={editBillDate}
+                      onChange={(e) => setEditBillDate(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Vendor GSTIN
+                    </label>
+                    <input
+                      type="text"
+                      value={editVendorGstin}
+                      onChange={(e) => setEditVendorGstin(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={`${inputClass} font-mono`}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Base Amount (INR)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={editBaseAmount}
+                      onChange={(e) => setEditBaseAmount(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Grand Total (INR)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={editAmount}
+                      onChange={(e) => setEditAmount(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={`${inputClass} font-semibold`}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      CGST (INR)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={editCgst}
+                      onChange={(e) => setEditCgst(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      SGST (INR)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={editSgst}
+                      onChange={(e) => setEditSgst(e.target.value)}
+                      disabled={!isPendingMainHead}
+                      className={inputClass}
+                    />
+                  </div>
+                </div>
+
+                {selectedBill.description && (
+                  <div className="p-3 bg-sage-50 border border-sage-200 rounded-lg text-xs text-stone-600">
+                    <strong className="text-stone-800">Prior Notes:</strong>{' '}
+                    {selectedBill.description}
+                  </div>
+                )}
+
+                {isPendingMainHead && (
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1">
+                      Main Event Head Audit Remark
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={reviewRemark}
+                      onChange={(e) => setReviewRemark(e.target.value)}
+                      placeholder="Verification remarks..."
+                      className={inputClass}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-6 py-4 border-t border-sage-100 bg-sage-50/50 flex justify-end gap-2.5">
+              <button
+                onClick={closeReviewModals}
+                className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
+              >
+                Close
+              </button>
+              {isPendingMainHead && (
+                <>
+                  <button
+                    onClick={() => setShowRejectModal(true)}
+                    className="px-4 py-2 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-medium cursor-pointer"
+                  >
+                    Reject
+                  </button>
+                  <button
+                    onClick={handleApproveBill}
+                    disabled={actionLoading}
+                    className="px-4 py-2 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-lg text-xs font-medium cursor-pointer"
+                  >
+                    {actionLoading ? 'Forwarding...' : 'Approve & Forward to Principal'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
-      {/* ─── MANDATORY REJECTION MODAL ─── */}
-      {showRejectModal && (
-        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl p-6 space-y-4">
-            <h3 className="text-lg font-bold text-slate-900">Mandatory Rejection Feedback</h3>
-            <p className="text-xs text-slate-500">
-              Specify why this bill is being rejected and returned to the coordinator.
-            </p>
-
+      {/* REJECTION MODAL (COMPULSORY REMARK) */}
+      {selectedBill && showRejectModal && (
+        <div className="fixed inset-0 bg-stone-900/45 flex items-center justify-center p-4 z-50">
+          <div className="bg-white w-full max-w-md rounded-xl border border-sage-200 p-6 space-y-4">
+            <h3 className="text-base font-semibold text-stone-900">Rejection Feedback</h3>
             <div>
-              <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                Reason for rejection:
+              <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                Reason
               </label>
               <select
                 value={rejectionReason}
                 onChange={(e) => setRejectionReason(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs text-slate-800 font-medium bg-white"
+                className={inputClass}
               >
-                <option value="Amount doesn't match the bill">Amount doesn't match the bill</option>
-                <option value="Missing or unreadable receipt image">Missing or unreadable receipt image</option>
-                <option value="Unapproved vendor / Event out-of-scope">Unapproved vendor / Event out-of-scope</option>
-                <option value="Sub-event budget allocation exceeded">Sub-event budget allocation exceeded</option>
+                <option value="Amount doesn't match the bill">
+                  Amount doesn&apos;t match the bill
+                </option>
+                <option value="Missing or unreadable receipt image">
+                  Missing or unreadable receipt image
+                </option>
+                <option value="Unapproved vendor / Event out-of-scope">
+                  Unapproved vendor / Event out-of-scope
+                </option>
+                <option value="Sub-event budget allocation exceeded">
+                  Sub-event budget allocation exceeded
+                </option>
               </select>
             </div>
-
             <div>
-              <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                Additional Remark (Optional):
+              <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                Compulsory Rejection Remark *
               </label>
               <textarea
-                rows={2}
-                value={mainHeadRemark}
-                onChange={(e) => setMainHeadRemark(e.target.value)}
-                placeholder="Add specific notes for the student..."
-                className="w-full p-2.5 border border-slate-300 rounded-lg text-xs"
+                rows={3}
+                required
+                value={rejectionRemark}
+                onChange={(e) => setRejectionRemark(e.target.value)}
+                placeholder="Enter compulsory remark explaining why this bill is being rejected..."
+                className={inputClass}
               />
             </div>
-
-            <div className="flex justify-end gap-3 pt-2">
+            <div className="flex justify-end gap-2.5 pt-2">
               <button
-                onClick={() => {
-                  setShowRejectModal(false);
-                  setSelectedBillId(null);
-                }}
-                className="px-4 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-600 hover:bg-slate-50"
+                onClick={() => setShowRejectModal(false)}
+                className="px-4 py-2 bg-white border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
               >
-                Cancel
+                Back
               </button>
               <button
                 onClick={handleConfirmReject}
                 disabled={actionLoading}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold shadow-md transition"
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-medium cursor-pointer"
               >
                 {actionLoading ? 'Submitting...' : 'Confirm Rejection'}
               </button>
             </div>
           </div>
         </div>
+      )}
+
+      {selectedBillForAudit && (
+        <AuditLogModal
+          billId={selectedBillForAudit}
+          onClose={() => setSelectedBillForAudit(null)}
+        />
       )}
     </div>
   );

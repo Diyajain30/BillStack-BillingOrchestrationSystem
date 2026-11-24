@@ -14,28 +14,24 @@ public class SubEvent {
     @Column(nullable = false)
     private String name;
 
-    private String festName = "Wings Technical Fest";
-
+    private String festName;
     private String department;
 
     @Column(columnDefinition = "TEXT")
     private String description;
 
-    @Column(nullable = false)
-    private Double budgetCap;
-
+    private Double budgetCap = 0.0;
     private Double advanceDisbursed = 0.0;
-
     private Double totalSpent = 0.0;
 
-    @Column(name = "wing_name")
     private String wingName;
-
-    @Column(name = "parent_event_id")
     private Long parentEventId;
-
-    @Column(name = "main_head_id")
     private Long mainHeadId;
+    private String mainHeadIds;
+    private String studentHeadIds;
+
+    private String createdDate;
+    private Integer eventYear;
 
     private Boolean closureRequested = false;
     private Boolean facultyClosureApproved = false;
@@ -46,18 +42,24 @@ public class SubEvent {
     @Column(nullable = false)
     private String status = "OPEN";
 
+    @Column(name = "coordinator_ids")
+    private String coordinatorIds;
+
+    @Column(name = "faculty_ids")
+    private String facultyIds;
+
     public SubEvent() {}
 
     public SubEvent(String name, String department, String description, Double budgetCap, Double advanceDisbursed) {
         this.name = name;
         this.department = department;
         this.description = description;
-        this.budgetCap = budgetCap;
+        this.budgetCap = budgetCap != null ? budgetCap : 0.0;
         this.advanceDisbursed = advanceDisbursed != null ? advanceDisbursed : 0.0;
+        this.totalSpent = 0.0;
         this.status = "OPEN";
     }
 
-    // Getters and Setters
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
 
@@ -91,6 +93,18 @@ public class SubEvent {
     public Long getMainHeadId() { return mainHeadId; }
     public void setMainHeadId(Long mainHeadId) { this.mainHeadId = mainHeadId; }
 
+    public String getMainHeadIds() { return mainHeadIds; }
+    public void setMainHeadIds(String mainHeadIds) { this.mainHeadIds = mainHeadIds; }
+
+    public String getStudentHeadIds() { return studentHeadIds; }
+    public void setStudentHeadIds(String studentHeadIds) { this.studentHeadIds = studentHeadIds; }
+
+    public String getCreatedDate() { return createdDate; }
+    public void setCreatedDate(String createdDate) { this.createdDate = createdDate; }
+
+    public Integer getEventYear() { return eventYear; }
+    public void setEventYear(Integer eventYear) { this.eventYear = eventYear; }
+
     public Boolean getClosureRequested() { return closureRequested; }
     public void setClosureRequested(Boolean closureRequested) { this.closureRequested = closureRequested; }
 
@@ -108,4 +122,10 @@ public class SubEvent {
 
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+
+    public String getCoordinatorIds() { return coordinatorIds; }
+    public void setCoordinatorIds(String coordinatorIds) { this.coordinatorIds = coordinatorIds; }
+
+    public String getFacultyIds() { return facultyIds; }
+    public void setFacultyIds(String facultyIds) { this.facultyIds = facultyIds; }
 }

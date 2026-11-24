@@ -1,688 +1,671 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { jsPDF } from 'jspdf';
-
-import axios from 'axios';
 import { backendApi } from '../services/api';
+import AuditLogModal from './AuditLogModal';
+import ReceiptPreviewPane from './ReceiptPreviewPane';
+import MasterEventExplorer from './MasterEventExplorer';
+import { MasterEventAnalytics } from './AnalyticsCharts';
 
-export default function PrincipalDashboard({ user }) {
+function getStatusBadgeClass(status) {
+  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
+  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+  return 'bg-amber-50 text-amber-800 border-amber-200';
+}
+
+export default function PrincipalDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  const [masterEvent, setMasterEvent] = useState(null);
-  const [subEvents, setSubEvents] = useState([]);
+  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Queue' | 'Profile'
   const [bills, setBills] = useState([]);
-  const [users, setUsers] = useState([]);
+  const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [feedback, setFeedback] = useState({ type: '', text: '' });
 
-  // Inspection Modal & Remarks State
-  const [selectedFolder, setSelectedFolder] = useState(null);
-  const [principalRemark, setPrincipalRemark] = useState('');
+  // Sanction & Rejection Modals (strictly read-only OCR details)
+  const [selectedBill, setSelectedBill] = useState(null);
+  const [selectedBillForAudit, setSelectedBillForAudit] = useState(null);
+  const [sanctionRemark, setSanctionRemark] = useState('');
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState(
+    'Exceeds sanctioned budget cap'
+  );
+  const [rejectionRemark, setRejectionRemark] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
 
-  // Rejection Modal State
-  const [showRejectModal, setShowRejectModal] = useState(false);
-  const [rejectingFolderId, setRejectingFolderId] = useState(null);
-  const [rejectionReason, setRejectionReason] = useState("Amount doesn't match the bill");
-
-  useEffect(() => {
-    fetchData();
-  }, []);
+  const showMessage = (type, text) => {
+    setFeedback({ type, text });
+    setTimeout(() => {
+      setFeedback((prev) => (prev.text === text ? { type: '', text: '' } : prev));
+    }, 5000);
+  };
 
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [billsRes, eventsRes, usersRes] = await Promise.all([
-        backendApi.get('/bills').catch(() => axios.get('http://localhost:8080/api/bills').catch(() => ({ data: [] }))),
-        backendApi.get('/events').catch(() => axios.get('http://localhost:8080/api/events').catch(() => ({ data: [] }))),
-        backendApi.get('/users').catch(() => axios.get('http://localhost:8080/api/users').catch(() => ({ data: [] }))),
+      const [billsRes, eventsRes] = await Promise.all([
+        backendApi.get('/bills').catch(() => ({ data: [] })),
+        backendApi
+          .get('/events')
+          .catch(() => backendApi.get('/subevents').catch(() => ({ data: [] }))),
       ]);
-
-      const allEvents = Array.isArray(eventsRes.data) ? eventsRes.data : [];
-      const foundMaster = allEvents.find((ev) => ev.parentEventId === null || ev.parentEventId === undefined);
-      const foundSubs = allEvents.filter((ev) => ev.parentEventId !== null && ev.parentEventId !== undefined);
-
-      setMasterEvent(foundMaster || null);
-      setSubEvents(foundSubs.length > 0 ? foundSubs : allEvents);
       setBills(Array.isArray(billsRes.data) ? billsRes.data : []);
-      setUsers(Array.isArray(usersRes.data) ? usersRes.data : []);
+      setAllEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
     } catch (error) {
-      console.error('Failed to sync principal dashboard data:', error);
+      console.error('Failed to load Principal dashboard data:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to sync dashboard data.'
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  // 1. Executive Sub-Event Folder PDF Report Generator
-  const generateSubEventPdf = (sub) => {
-    const doc = new jsPDF();
-    const folderBills = bills.filter(
-      (b) =>
-        (b.subEventId && String(b.subEventId) === String(sub.id)) ||
-        (b.eventName && b.eventName.toLowerCase().trim() === sub.name.toLowerCase().trim())
-    );
-    const subSpent = folderBills.reduce((acc, b) => acc + (Number(b.amount) || 0), 0);
-    const assignedStudent = users.find((u) => u.id === Number(sub.studentCoordinatorId));
-    const assignedFaculty = users.find((u) => u.id === Number(sub.facultyHeadId));
+  useEffect(() => {
+    fetchData();
+  }, []);
 
-    doc.setFillColor(15, 23, 42);
-    doc.rect(0, 0, 210, 38, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(16);
-    doc.setFont('helvetica', 'bold');
-    doc.text('PRINCIPAL SANCTION & AUDIT DOSSIER', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Sub-Event: ${sub.name} | Department: ${sub.department} | ID: #${sub.id}`, 14, 28);
-
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(11);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Leadership Assignment & Budget Summary', 14, 48);
-
-    doc.autoTable({
-      startY: 53,
-      head: [['Sanctioned Budget Cap', 'Total Outflow Spent', 'Student Lead', 'Faculty Head']],
-      body: [
-        [
-          `Rs. ${sub.budgetCap?.toLocaleString('en-IN')}`,
-          `Rs. ${subSpent.toLocaleString('en-IN')}`,
-          assignedStudent ? (assignedStudent.username || assignedStudent.name) : 'Unassigned',
-          assignedFaculty ? (assignedFaculty.username || assignedFaculty.name) : 'Unassigned',
-        ],
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [30, 41, 59] },
-    });
-
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Itemized Expenditure Vouchers', 14, currentY);
-
-    const bRows = folderBills.map((b) => [
-      `#${b.billNo || b.id}`,
-      b.vendorName || 'N/A',
-      b.billDate || 'N/A',
-      `Rs. ${Number(b.amount).toFixed(2)}`,
-      b.status,
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Invoice No', 'Vendor Name', 'Date', 'Amount', 'Status']],
-      body: bRows,
-      theme: 'grid',
-      headStyles: { fillColor: [30, 41, 59] },
-    });
-
-    doc.save(`Principal_Audit_${sub.name.replace(/\s+/g, '_')}.pdf`);
+  const closeModals = () => {
+    setSelectedBill(null);
+    setShowRejectModal(false);
+    setSanctionRemark('');
+    setRejectionRemark('');
+    setRejectionReason('Exceeds sanctioned budget cap');
   };
 
-  // 2. Complete Master Executive Summary PDF
-  const generateMasterExecutivePdf = () => {
-    const doc = new jsPDF();
-    const festName = masterEvent ? (masterEvent.name || masterEvent.wingName) : 'WINGS Fest Master Portfolio';
-
-    doc.setFillColor(15, 23, 42);
-    doc.rect(0, 0, 210, 38, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(18);
-    doc.setFont('helvetica', 'bold');
-    doc.text('EXECUTIVE PRINCIPAL FEST AUDIT REPORT', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Master Event Container: ${festName} | Generated: ${new Date().toLocaleDateString()}`, 14, 28);
-
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(12);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Global Financial Overview', 14, 48);
-
-    const totalBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-    const totalSpent = bills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-
-    doc.autoTable({
-      startY: 53,
-      head: [['Total Fest Sanction', 'Total Disbursed Outflow', 'Remaining Buffer', 'Active Sub-Events']],
-      body: [
-        [
-          `Rs. ${totalBudget?.toLocaleString('en-IN')}`,
-          `Rs. ${totalSpent.toLocaleString('en-IN')}`,
-          `Rs. ${(totalBudget - totalSpent).toLocaleString('en-IN')}`,
-          subEvents.length,
-        ],
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [15, 23, 42] },
-    });
-
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Sub-Events Department Breakdown', 14, currentY);
-
-    const subRows = subEvents.map((s) => [
-      `#${s.id}`,
-      s.name,
-      s.department,
-      `Rs. ${s.budgetCap?.toLocaleString('en-IN')}`,
-      s.status || 'OPEN',
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['ID', 'Sub-Event Name', 'Department', 'Budget Cap', 'Status']],
-      body: subRows,
-      theme: 'grid',
-      headStyles: { fillColor: [30, 41, 59] },
-    });
-
-    doc.save(`${festName.replace(/\s+/g, '_')}_Executive_Summary.pdf`);
-  };
-
-  // 3. Approve Sub-Event Folder Status
-  const handleApproveStatus = async (subEventId) => {
+  const handleSanction = async () => {
+    if (!selectedBill) return;
     setActionLoading(true);
     try {
-      await backendApi
-        .put(`/events/${subEventId}`, {
-          status: 'APPROVED',
-          description: principalRemark ? `Principal remark: ${principalRemark}` : undefined,
-        })
-        .catch(() =>
-          axios.put(`http://localhost:8080/api/events/${subEventId}`, {
-            status: 'APPROVED',
-            description: principalRemark ? `Principal remark: ${principalRemark}` : undefined,
-          })
-        );
-
-      alert('Sub-Event Folder status updated to "APPROVED" successfully!');
-      setSelectedFolder(null);
-      setPrincipalRemark('');
-      fetchData();
-    } catch (err) {
-      console.error('Failed to update status:', err);
-      alert('Failed to update event status.');
+      await backendApi.put(`/bills/${selectedBill.id}/status`, {
+        status: 'APPROVED',
+        role: 'PRINCIPAL',
+        actorId: user?.id,
+        remark:
+          sanctionRemark ||
+          'Sanctioned by Principal and forwarded to Storekeeper.',
+      });
+      showMessage(
+        'success',
+        `Bill #${selectedBill.billNo || selectedBill.id} sanctioned and routed to Storekeeper.`
+      );
+      closeModals();
+      await fetchData();
+    } catch (error) {
+      console.error('Principal sanction failed:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to sanction bill.'
+      );
     } finally {
       setActionLoading(false);
     }
   };
 
-  // 4. Trigger Rejection Modal
-  const handleOpenRejectModal = (subEventId) => {
-    setRejectingFolderId(subEventId);
-    setShowRejectModal(true);
-  };
-
-  // 5. Confirm Rejection with Reason and Role
+  // Step-back rejection loop: compulsory remark, returns to previous stage (Main Event Head / Faculty / Coordinator)
   const handleConfirmReject = async () => {
-    if (!rejectingFolderId) return;
+    if (!selectedBill) return;
+    if (!rejectionRemark.trim()) {
+      showMessage(
+        'error',
+        'A rejection remark is compulsory when disapproving/rejecting a bill.'
+      );
+      return;
+    }
+
     setActionLoading(true);
     try {
-      await backendApi
-        .put(`/events/${rejectingFolderId}`, {
-          status: 'REJECTED',
-          description: `Rejected by PRINCIPAL. Reason: ${rejectionReason}${principalRemark ? ' | Note: ' + principalRemark : ''}`,
-        })
-        .catch(() =>
-          axios.put(`http://localhost:8080/api/events/${rejectingFolderId}`, {
-            status: 'REJECTED',
-            description: `Rejected by PRINCIPAL. Reason: ${rejectionReason}${principalRemark ? ' | Note: ' + principalRemark : ''}`,
-          })
-        );
-
-      alert('Sub-Event Folder rejected successfully and returned for correction!');
-      setShowRejectModal(false);
-      setRejectingFolderId(null);
-      setSelectedFolder(null);
-      setPrincipalRemark('');
-      setRejectionReason("Amount doesn't match the bill");
-      fetchData();
-    } catch (err) {
-      console.error('Failed to reject folder:', err);
-      alert('Failed to record rejection.');
+      await backendApi.put(`/bills/${selectedBill.id}/status`, {
+        status: 'REJECTED',
+        stepBack: true,
+        role: 'PRINCIPAL',
+        actorId: user?.id,
+        remark: rejectionRemark.trim(),
+        rejectionReason,
+        rejectedBy: 'PRINCIPAL',
+      });
+      showMessage(
+        'success',
+        `Bill #${selectedBill.billNo || selectedBill.id} stepped back with compulsory remark.`
+      );
+      closeModals();
+      await fetchData();
+    } catch (error) {
+      console.error('Principal rejection failed:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to record rejection.'
+      );
     } finally {
       setActionLoading(false);
     }
   };
 
-  // Statistical Computations
-  const totalFestBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-  const totalAuditedSpent = bills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-  const utilizationPercentage = totalFestBudget > 0 ? Math.min(100, Math.round((totalAuditedSpent / totalFestBudget) * 100)) : 0;
-  const pendingCount = subEvents.filter((s) => !s.status || s.status === 'OPEN' || s.status === 'PENDING_PRINCIPAL').length;
+  const handleSignOut = () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    if (typeof onLogout === 'function') onLogout();
+    navigate('/', { replace: true });
+  };
+
+  const masterEvents = allEvents.filter(
+    (ev) => ev.parentEventId === null || ev.parentEventId === undefined
+  );
+  const subEvents = allEvents.filter(
+    (ev) => ev.parentEventId !== null && ev.parentEventId !== undefined
+  );
+
+  const pendingPrincipalBills = bills.filter(
+    (b) => b.status === 'PENDING_PRINCIPAL'
+  );
+  const totalBudgetSanctioned = (
+    masterEvents.length > 0 ? masterEvents : subEvents
+  ).reduce((acc, ev) => acc + (Number(ev.budgetCap) || 0), 0);
+  const totalApprovedSpend = bills
+    .filter((b) => b.status === 'APPROVED')
+    .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+
+  const navItems = [
+    { id: 'Folders', label: 'Master Events', count: masterEvents.length },
+    {
+      id: 'Queue',
+      label: 'Sanction Queue',
+      count: pendingPrincipalBills.length,
+    },
+    { id: 'Profile', label: 'Profile' },
+  ];
+
+  const inputClass =
+    'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex font-sans">
-      
-      {/* Sidebar */}
-      <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between p-6 shrink-0">
-        <div className="space-y-6">
+    <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
+      <header className="bg-white border-b border-sage-200 sticky top-0 z-30">
+        <div className="px-6 py-3.5 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-violet-600 flex items-center justify-center text-xl font-black text-white shadow-lg">
-              🎓
-            </div>
-            <div>
-              <span className="text-xl font-black tracking-wider text-violet-400">BillStack</span>
-              <span className="block bg-violet-950 border border-violet-800 text-violet-300 text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider w-fit mt-0.5">
-                Principal Portal
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-sage-900">
+                BillStack
               </span>
+              <span className="text-stone-300">/</span>
+              <h1 className="text-sm font-medium text-stone-700">
+                Principal Sanction Portal
+              </h1>
             </div>
           </div>
 
-          <nav className="space-y-1.5 pt-4">
-            <div className="px-4 py-3 bg-violet-950/60 border border-violet-800/80 rounded-xl text-xs font-bold text-white flex items-center justify-between">
-              <span className="flex items-center gap-2">
-                <span>📊</span> Executive Overview
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-violet-300 font-extrabold">
-                {subEvents.length}
-              </span>
-            </div>
-          </nav>
-        </div>
-
-        <div className="pt-6 border-t border-slate-800">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-8 h-8 rounded-full bg-violet-700 flex items-center justify-center text-sm font-bold text-white">
-              {user?.name ? user.name[0].toUpperCase() : 'P'}
-            </div>
-            <div className="overflow-hidden">
-              <p className="text-xs font-bold truncate text-slate-200">{user?.name || 'Principal'}</p>
-              <p className="text-[10px] text-slate-400 truncate">INSTITUTIONAL HEAD</p>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              localStorage.clear();
-              navigate('/');
-            }}
-            className="w-full py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-xs font-bold text-slate-300 transition"
-          >
-            Sign Out
-          </button>
-        </div>
-      </aside>
-
-      {/* Main Workspace */}
-      <main className="flex-1 p-8 overflow-y-auto max-w-6xl space-y-6">
-        
-        {/* Header Banner */}
-        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-slate-800">
-          <div>
-            <h1 className="text-2xl font-black text-white tracking-tight">Principal Executive Dashboard</h1>
-            <p className="text-xs text-slate-400 mt-1">
-              Statistical oversight of institutional event portfolios, budget burn rates, and final administrative approval sanctions.
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={generateMasterExecutivePdf}
-              className="px-4 py-2.5 bg-violet-600 hover:bg-violet-500 rounded-xl text-xs font-bold text-white shadow-md transition flex items-center gap-2"
-            >
-              🖨️ Download Executive Summary (PDF)
-            </button>
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-medium text-stone-800 hidden sm:inline">
+              {user?.name || user?.username || 'Principal'}
+            </span>
             <button
               onClick={fetchData}
-              className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-bold text-slate-200 shadow-sm transition"
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
             >
-              ↻ Sync
+              Sync
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Sign Out
             </button>
           </div>
-        </header>
+        </div>
+      </header>
 
-        {/* Statistical Overview Cards */}
-        <section className="grid grid-cols-1 md:grid-cols-4 gap-5">
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm space-y-1">
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Fest Allocation</span>
-            <h2 className="text-2xl font-black text-white">₹{totalFestBudget.toLocaleString('en-IN')}</h2>
-            <p className="text-[11px] text-slate-400">{subEvents.length} Department Folders</p>
-          </div>
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 bg-white border-r border-sage-200 p-4 shrink-0 hidden md:block">
+          <nav className="space-y-1.5">
+            {navItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
+                  activeTab === item.id
+                    ? 'bg-sage-100 text-sage-900 border border-sage-200'
+                    : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
+                }`}
+              >
+                <span>{item.label}</span>
+                {item.count !== undefined && (
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-md border ${
+                      item.id === 'Queue' && item.count > 0
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-white text-stone-600 border-sage-200'
+                    }`}
+                  >
+                    {item.count}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </aside>
 
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm space-y-1">
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Audited Outflow</span>
-            <h2 className="text-2xl font-black text-emerald-400">₹{totalAuditedSpent.toLocaleString('en-IN')}</h2>
-            <p className="text-[11px] text-slate-400">Across verified invoices</p>
-          </div>
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto min-w-0">
+          <div className="max-w-6xl mx-auto space-y-6">
+            <div className="flex gap-2 overflow-x-auto pb-1 md:hidden">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-medium shrink-0 transition cursor-pointer ${
+                    activeTab === item.id
+                      ? 'bg-sage-600 text-white'
+                      : 'bg-white border border-sage-200 text-stone-600'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
 
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm space-y-1">
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Budget Burn Rate</span>
-            <h2 className="text-2xl font-black text-violet-400">{utilizationPercentage}%</h2>
-            <div className="w-full bg-slate-700 h-1.5 rounded-full overflow-hidden mt-2">
+            {feedback.text && (
               <div
-                className={`h-full ${utilizationPercentage > 85 ? 'bg-rose-500' : 'bg-violet-500'}`}
-                style={{ width: `${utilizationPercentage}%` }}
-              ></div>
-            </div>
-          </div>
+                className={`px-4 py-3 rounded-lg border text-xs font-medium ${
+                  feedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : 'bg-sage-100 border-sage-200 text-sage-900'
+                }`}
+              >
+                {feedback.text}
+              </div>
+            )}
 
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm space-y-1">
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Pending Sanctions</span>
-            <h2 className="text-2xl font-black text-amber-400">{pendingCount}</h2>
-            <p className="text-[11px] text-slate-400">Requires executive review</p>
-          </div>
-        </section>
-
-        {/* Sub-Event Folders & Approval Queue */}
-        <section className="space-y-4">
-          <div className="flex justify-between items-center">
-            <h2 className="text-lg font-black text-white flex items-center gap-2">
-              <span>📁</span> Event Folders & Approval Queue ({subEvents.length})
-            </h2>
-            <span className="text-xs text-slate-400">Click any card to inspect folder contents and grant approval</span>
-          </div>
-
-          {loading ? (
-            <div className="p-12 text-center text-xs font-bold text-slate-400">Loading institutional portfolios...</div>
-          ) : subEvents.length === 0 ? (
-            <div className="p-12 text-center bg-slate-800/40 border border-slate-800 rounded-2xl text-slate-400 text-xs">
-              No sub-event folders found under the master container.
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {subEvents.map((evt) => {
-                const folderBills = bills.filter(
-                  (b) =>
-                    (b.subEventId && String(b.subEventId) === String(evt.id)) ||
-                    (b.eventName && b.eventName.toLowerCase().trim() === evt.name.toLowerCase().trim())
-                );
-                const subSpent = folderBills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-                const subCap = evt.budgetCap || 1;
-                const subUtil = Math.min(100, Math.round((subSpent / subCap) * 100));
-
-                return (
-                  <div
-                    key={evt.id}
-                    className="bg-slate-800/60 border border-slate-700/80 hover:border-violet-500 rounded-2xl p-5 space-y-4 transition shadow-sm hover:shadow-md flex flex-col justify-between"
-                  >
-                    <div onClick={() => setSelectedFolder(evt)} className="cursor-pointer space-y-2.5">
-                      <div className="flex justify-between items-center">
-                        <span className="text-[10px] font-bold px-2.5 py-0.5 rounded bg-violet-950 text-violet-300 border border-violet-800">
-                          {evt.department}
-                        </span>
-                        <span
-                          className={`text-[10px] font-extrabold px-2.5 py-0.5 rounded-full ${
-                            evt.status === 'APPROVED'
-                              ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                              : evt.status === 'REJECTED'
-                              ? 'bg-rose-950 text-rose-300 border border-rose-800'
-                              : 'bg-amber-950 text-amber-300 border border-amber-800'
-                          }`}
-                        >
-                          {evt.status || 'PENDING'}
-                        </span>
-                      </div>
-
-                      <div>
-                        <h3 className="text-base font-bold text-white">📁 {evt.name}</h3>
-                        <span className="text-[11px] font-mono text-slate-400">Sub-Event ID: #{evt.id}</span>
-                      </div>
-                    </div>
-
-                    <div onClick={() => setSelectedFolder(evt)} className="bg-slate-900/60 p-3 rounded-xl border border-slate-800 space-y-2 text-xs cursor-pointer">
-                      <div className="flex justify-between text-slate-400">
-                        <span>Sanctioned Budget:</span>
-                        <span className="font-bold text-slate-200">₹{evt.budgetCap?.toLocaleString('en-IN')}</span>
-                      </div>
-                      <div className="flex justify-between text-slate-400">
-                        <span>Audited Spent:</span>
-                        <span className="font-bold text-emerald-400">₹{subSpent.toLocaleString('en-IN')}</span>
-                      </div>
-                      <div>
-                        <div className="flex justify-between text-[10px] text-slate-400 mb-1">
-                          <span>Utilization ({subUtil}%)</span>
-                          <span>{folderBills.length} Vouchers</span>
-                        </div>
-                        <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full ${subUtil > 90 ? 'bg-rose-500' : 'bg-emerald-500'}`}
-                            style={{ width: `${subUtil}%` }}
-                          ></div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 border-t border-slate-700/60 flex justify-between items-center text-xs">
-                      <button
-                        onClick={() => generateSubEventPdf(evt)}
-                        className="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[10px] font-bold transition shadow-sm"
-                      >
-                        🖨️ PDF
-                      </button>
-                      <div className="flex gap-1.5">
-                        <button
-                          onClick={() => handleOpenRejectModal(evt.id)}
-                          className="px-2.5 py-1 bg-rose-900/60 hover:bg-rose-900 text-rose-200 rounded-lg text-[10px] font-bold transition"
-                        >
-                          ✕ Reject
-                        </button>
-                        <button
-                          onClick={() => handleApproveStatus(evt.id)}
-                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[10px] font-bold transition"
-                        >
-                          ✓ Approve
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        {/* FOLDER INSPECTION & APPROVAL MODAL */}
-        {selectedFolder && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto text-slate-100">
-              
-              {/* Modal Header */}
-              <div className="flex justify-between items-start border-b border-slate-800 pb-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">📁</span>
-                    <h3 className="text-xl font-black text-white">{selectedFolder.name}</h3>
-                    <span className="text-xs font-bold px-2.5 py-0.5 bg-violet-950 text-violet-300 border border-violet-800 rounded-md">
-                      {selectedFolder.department}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-400 mt-1">
-                    Lifecycle Status: <strong className="text-emerald-400">{selectedFolder.status || 'PENDING'}</strong>
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => generateSubEventPdf(selectedFolder)}
-                    className="px-3 py-1.5 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-xs font-bold transition shadow"
-                  >
-                    🖨️ Print Dossier PDF
-                  </button>
-                  <button onClick={() => setSelectedFolder(null)} className="text-slate-400 hover:text-white text-2xl font-bold">✕</button>
-                </div>
+            <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">
+                  Total Budget Sanctioned
+                </p>
+                <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                  INR {totalBudgetSanctioned.toLocaleString('en-IN')}
+                </p>
+                <p className="text-xs text-stone-400 mt-1">
+                  {masterEvents.length} Master &middot; {subEvents.length}{' '}
+                  Sub-Events
+                </p>
               </div>
 
-              {/* Folder Financial Metrics */}
-              <div className="grid grid-cols-3 gap-3 text-xs">
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Sanctioned Budget Cap</span>
-                  <span className="text-base font-black text-white">₹{selectedFolder.budgetCap?.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Total Outflow Spent</span>
-                  <span className="text-base font-black text-emerald-400">
-                    ₹{bills
-                      .filter(
-                        (b) =>
-                          (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) ||
-                          (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())
-                      )
-                      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0)
-                      .toLocaleString('en-IN')}
-                  </span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Net Buffer Balance</span>
-                  <span className="text-base font-black text-violet-400">
-                    ₹{(
-                      selectedFolder.budgetCap -
-                      bills
-                        .filter(
-                          (b) =>
-                            (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) ||
-                            (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())
-                        )
-                        .reduce((sum, b) => sum + (Number(b.amount) || 0), 0)
-                    ).toLocaleString('en-IN')}
-                  </span>
-                </div>
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">
+                  Approved Expenditure
+                </p>
+                <p className="text-2xl font-semibold text-sage-800 mt-1.5">
+                  INR {totalApprovedSpend.toLocaleString('en-IN')}
+                </p>
+                <p className="text-xs text-stone-400 mt-1">Approved bills only</p>
               </div>
 
-              {/* Vouchers Table */}
-              <div className="space-y-3">
-                <h4 className="text-sm font-bold text-white flex items-center gap-2">
-                  <span>📑</span> Itemized Vouchers in this Folder
-                </h4>
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">
+                  Awaiting Sanction
+                </p>
+                <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                  {pendingPrincipalBills.length}
+                </p>
+                <p className="text-xs text-stone-400 mt-1">
+                  Pending Principal sign-off
+                </p>
+              </div>
+            </section>
 
-                {bills.filter(
-                  (b) =>
-                    (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) ||
-                    (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())
-                ).length === 0 ? (
-                  <div className="p-8 text-center text-slate-500 bg-slate-950/40 rounded-xl border border-dashed border-slate-800 text-xs">
-                    No vouchers uploaded to this folder yet.
+            {/* MASTER EVENTS DRILL-DOWN TAB */}
+            {activeTab === 'Folders' &&
+              (loading ? (
+                <div className="bg-white p-10 rounded-xl border border-sage-200 text-center text-xs text-stone-500">
+                  Loading master event files...
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <MasterEventAnalytics
+                    masterEvents={masterEvents}
+                    subEvents={subEvents}
+                    bills={bills}
+                  />
+
+                  <MasterEventExplorer
+                    allEvents={allEvents}
+                    bills={bills}
+                    pendingStatus="PENDING_PRINCIPAL"
+                    onReviewBill={(b) => setSelectedBill(b)}
+                    onAuditLogs={(billId) => setSelectedBillForAudit(billId)}
+                    reviewButtonLabel={(b) =>
+                      b.status === 'PENDING_PRINCIPAL'
+                        ? 'Inspect & Sanction'
+                        : 'View'
+                    }
+                  />
+                </div>
+              ))}
+
+            {/* SANCTION QUEUE TAB */}
+            {activeTab === 'Queue' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Bills Awaiting Principal Sanction (
+                  {pendingPrincipalBills.length})
+                </h2>
+
+                {loading ? (
+                  <div className="py-10 text-center text-xs text-stone-500">
+                    Loading bills...
+                  </div>
+                ) : pendingPrincipalBills.length === 0 ? (
+                  <div className="py-10 text-center bg-sage-50/50 border border-sage-200/80 rounded-lg text-xs text-stone-500">
+                    No bills pending Principal sanction right now.
                   </div>
                 ) : (
-                  <div className="overflow-x-auto border border-slate-800 rounded-xl">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-slate-950 text-slate-400 font-bold border-b border-slate-800">
-                        <tr>
-                          <th className="py-2.5 px-3">Invoice No</th>
-                          <th className="py-2.5 px-3">Vendor</th>
-                          <th className="py-2.5 px-3">Amount</th>
-                          <th className="py-2.5 px-3">Date</th>
-                          <th className="py-2.5 px-3">Status</th>
+                  <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                    <table className="w-full text-left text-sm border-collapse">
+                      <thead>
+                        <tr className="border-b border-sage-200 bg-sage-50 text-stone-600 text-xs font-medium">
+                          <th className="py-3 px-4">Invoice No</th>
+                          <th className="py-3 px-4">Vendor &amp; Event</th>
+                          <th className="py-3 px-4">Amount</th>
+                          <th className="py-3 px-4">Status</th>
+                          <th className="py-3 px-4 text-center">Action</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-800 text-slate-300">
-                        {bills
-                          .filter(
-                            (b) =>
-                              (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) ||
-                              (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())
-                          )
-                          .map((b) => (
-                            <tr key={b.id} className="hover:bg-slate-800/40">
-                              <td className="py-2.5 px-3 font-mono text-violet-300 font-bold">#{b.billNo || b.id}</td>
-                              <td className="py-2.5 px-3 font-semibold text-white">{b.vendorName}</td>
-                              <td className="py-2.5 px-3 font-black text-white">₹{Number(b.amount).toFixed(2)}</td>
-                              <td className="py-2.5 px-3 text-slate-400">{b.billDate || 'N/A'}</td>
-                              <td className="py-2.5 px-3">
-                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300">
-                                  {b.status}
-                                </span>
-                              </td>
-                            </tr>
-                          ))}
+                      <tbody className="divide-y divide-sage-100 text-stone-800">
+                        {pendingPrincipalBills.map((bill) => (
+                          <tr
+                            key={bill.id}
+                            className="hover:bg-sage-50/50 transition"
+                          >
+                            <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                              {bill.billNo || bill.id}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-medium text-stone-900 block">
+                                {bill.vendorName}
+                              </span>
+                              <span className="text-xs text-stone-500">
+                                {bill.eventName || 'General'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 font-medium text-stone-900">
+                              INR {Number(bill.amount || 0).toFixed(2)}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span
+                                className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
+                                  bill.status
+                                )}`}
+                              >
+                                {bill.status}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 text-center">
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  onClick={() => setSelectedBill(bill)}
+                                  className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  Inspect &amp; Sanction
+                                </button>
+                                <button
+                                  onClick={() => setSelectedBillForAudit(bill.id)}
+                                  className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  Logs
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>
                 )}
-              </div>
+              </section>
+            )}
 
-              {/* Principal Sanction Actions */}
-              <div className="pt-4 border-t border-slate-800 space-y-3 bg-slate-950/60 p-4 rounded-xl border">
-                <h4 className="text-xs font-black uppercase text-violet-400">Principal Executive Sanction Authorization</h4>
-                
-                <div>
-                  <label className="block text-xs font-bold text-slate-400 mb-1">Executive Remark / Feedback:</label>
-                  <textarea
-                    rows={2}
-                    value={principalRemark}
-                    onChange={(e) => setPrincipalRemark(e.target.value)}
-                    placeholder="e.g., Reviewed itemized expenses; sanctioned for final storekeeper registry."
-                    className="w-full p-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white outline-none focus:border-violet-500"
-                  />
+            {/* PROFILE TAB */}
+            {activeTab === 'Profile' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] max-w-lg space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Profile
+                </h2>
+                <div className="space-y-3 text-sm">
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Full Name</span>
+                    <span className="font-medium text-stone-900">
+                      {user?.name || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Username</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.username || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Role</span>
+                    <span className="font-medium text-sage-800">
+                      {user?.role || 'PRINCIPAL'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Department</span>
+                    <span className="text-stone-800">
+                      {user?.department || 'Institutional'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2">
+                    <span className="text-stone-500">Staff ID</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.institutionalId || 'N/A'}
+                    </span>
+                  </div>
                 </div>
-
-                <div className="flex justify-end gap-3 pt-1">
-                  <button
-                    onClick={() => handleOpenRejectModal(selectedFolder.id)}
-                    disabled={actionLoading}
-                    className="px-4 py-2 bg-rose-900/60 hover:bg-rose-900 text-rose-200 border border-rose-700 rounded-xl text-xs font-bold transition"
-                  >
-                    {actionLoading ? 'Processing...' : '✕ Reject Folder Sanction'}
-                  </button>
-                  <button
-                    onClick={() => handleApproveStatus(selectedFolder.id)}
-                    disabled={actionLoading}
-                    className="px-5 py-2 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-xs font-bold shadow-md transition"
-                  >
-                    {actionLoading ? 'Processing...' : '✓ Approve & Sanction Folder'}
-                  </button>
-                </div>
-              </div>
-
-            </div>
+              </section>
+            )}
           </div>
-        )}
+        </main>
+      </div>
 
-        {/* ─── MANDATORY REJECTION MODAL ─── */}
-        {showRejectModal && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-md rounded-2xl shadow-2xl p-6 space-y-4 text-slate-100">
-              <h3 className="text-lg font-black text-white">Mandatory Rejection Feedback</h3>
-              <p className="text-xs text-slate-400">
-                Specify why this sub-event folder / sanction is being rejected and returned for correction.
-              </p>
-
+      {/* SIDE-BY-SIDE SANCTION MODAL (STRICTLY READ-ONLY OCR DETAILS) */}
+      {selectedBill && !showRejectModal && (
+        <div className="fixed inset-0 bg-stone-900/45 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-sage-200 w-full max-w-5xl rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.08)] max-h-[92vh] overflow-hidden flex flex-col">
+            <div className="px-6 py-4 border-b border-sage-100 bg-sage-50/60 flex justify-between items-center">
               <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">
-                  Reason for rejection:
-                </label>
-                <select
-                  value={rejectionReason}
-                  onChange={(e) => setRejectionReason(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-slate-200 font-medium outline-none focus:border-violet-500"
-                >
-                  <option value="Amount doesn't match the bill">Amount doesn't match the bill</option>
-                  <option value="Missing or unreadable receipt image">Missing or unreadable receipt image</option>
-                  <option value="Unapproved vendor / Event out-of-scope">Unapproved vendor / Event out-of-scope</option>
-                  <option value="Sub-event budget allocation exceeded">Sub-event budget allocation exceeded</option>
-                </select>
+                <h3 className="text-base font-semibold text-stone-900">
+                  Principal Sanction Review
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Inspect the scanned receipt side-by-side with read-only particulars before sanctioning.
+                </p>
               </div>
+              <button
+                onClick={closeModals}
+                className="text-xs font-medium text-stone-500 hover:text-stone-800 cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">
-                  Additional Remark (Optional):
-                </label>
-                <textarea
-                  rows={2}
-                  value={principalRemark}
-                  onChange={(e) => setPrincipalRemark(e.target.value)}
-                  placeholder="Add specific notes for correction..."
-                  className="w-full p-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white outline-none focus:border-violet-500"
+            <div className="p-6 overflow-y-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-6">
+                <ReceiptPreviewPane
+                  receiptImage={selectedBill.receiptImage}
+                  billNo={selectedBill.billNo || selectedBill.id}
                 />
               </div>
 
-              <div className="flex justify-end gap-3 pt-2">
-                <button
-                  onClick={() => {
-                    setShowRejectModal(false);
-                    setRejectingFolderId(null);
-                  }}
-                  className="px-4 py-2 border border-slate-700 rounded-xl text-xs font-bold text-slate-300 hover:bg-slate-800 transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleConfirmReject}
-                  disabled={actionLoading}
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold shadow-md transition"
-                >
-                  {actionLoading ? 'Submitting...' : 'Confirm Rejection'}
-                </button>
+              <div className="lg:col-span-6 space-y-4">
+                <div className="bg-sage-50/60 border border-sage-200 rounded-xl p-4 grid grid-cols-2 gap-3 text-xs">
+                  <div>
+                    <span className="text-stone-500 block">Vendor Name</span>
+                    <span className="font-semibold text-stone-900">
+                      {selectedBill.vendorName || 'N/A'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Invoice Number</span>
+                    <span className="font-mono font-medium text-stone-900">
+                      {selectedBill.billNo || selectedBill.id}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Bill Date</span>
+                    <span className="font-medium text-stone-900">
+                      {selectedBill.billDate || 'N/A'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Vendor GSTIN</span>
+                    <span className="font-mono text-stone-900">
+                      {selectedBill.vendorGstin || 'Unregistered'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Base Amount</span>
+                    <span className="font-medium text-stone-900">
+                      INR {Number(selectedBill.baseAmount || 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">CGST / SGST</span>
+                    <span className="font-medium text-stone-900">
+                      INR {Number(selectedBill.cgst || 0).toFixed(2)} / INR{' '}
+                      {Number(selectedBill.sgst || 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="col-span-2 pt-2 border-t border-sage-200 flex justify-between items-center">
+                    <span className="font-semibold text-stone-700">
+                      Grand Total
+                    </span>
+                    <span className="text-base font-bold text-sage-900">
+                      INR{' '}
+                      {Number(selectedBill.amount || 0).toLocaleString('en-IN')}
+                    </span>
+                  </div>
+                </div>
+
+                {selectedBill.description && (
+                  <div className="p-3 bg-white border border-sage-200 rounded-lg text-xs text-stone-600">
+                    <strong className="text-stone-800">
+                      Prior Audit Notes:
+                    </strong>{' '}
+                    {selectedBill.description}
+                  </div>
+                )}
+
+                {selectedBill.status === 'PENDING_PRINCIPAL' && (
+                  <div>
+                    <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                      Sanction Note
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={sanctionRemark}
+                      onChange={(e) => setSanctionRemark(e.target.value)}
+                      placeholder="Optional sanction remarks..."
+                      className={inputClass}
+                    />
+                  </div>
+                )}
               </div>
             </div>
-          </div>
-        )}
 
-      </main>
+            <div className="px-6 py-4 border-t border-sage-100 bg-sage-50/50 flex justify-end gap-2.5">
+              <button
+                onClick={closeModals}
+                className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
+              >
+                Close
+              </button>
+              {selectedBill.status === 'PENDING_PRINCIPAL' && (
+                <>
+                  <button
+                    onClick={() => setShowRejectModal(true)}
+                    className="px-4 py-2 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-medium cursor-pointer"
+                  >
+                    Disapprove
+                  </button>
+                  <button
+                    onClick={handleSanction}
+                    disabled={actionLoading}
+                    className="px-4 py-2 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-lg text-xs font-medium cursor-pointer"
+                  >
+                    {actionLoading ? 'Sanctioning...' : 'Sanction Bill'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DISAPPROVE MODAL (COMPULSORY REMARK) */}
+      {selectedBill && showRejectModal && (
+        <div className="fixed inset-0 bg-stone-900/45 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-sage-200 w-full max-w-md rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.08)] p-6 space-y-4">
+            <h3 className="text-base font-semibold text-stone-900">
+              Disapproval Feedback
+            </h3>
+            <div>
+              <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                Reason
+              </label>
+              <select
+                value={rejectionReason}
+                onChange={(e) => setRejectionReason(e.target.value)}
+                className={inputClass}
+              >
+                <option value="Exceeds sanctioned budget cap">
+                  Exceeds sanctioned budget cap
+                </option>
+                <option value="Not aligned with institutional norms">
+                  Not aligned with institutional norms
+                </option>
+                <option value="Insufficient supporting documentation">
+                  Insufficient supporting documentation
+                </option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                Compulsory Rejection Remark *
+              </label>
+              <textarea
+                rows={3}
+                required
+                value={rejectionRemark}
+                onChange={(e) => setRejectionRemark(e.target.value)}
+                placeholder="Enter compulsory remark explaining why this bill is being stepped back..."
+                className={inputClass}
+              />
+            </div>
+            <div className="flex justify-end gap-2.5 pt-2">
+              <button
+                onClick={() => setShowRejectModal(false)}
+                className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
+              >
+                Back
+              </button>
+              <button
+                onClick={handleConfirmReject}
+                disabled={actionLoading}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white rounded-lg text-xs font-medium cursor-pointer"
+              >
+                {actionLoading ? 'Submitting...' : 'Confirm Disapproval'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedBillForAudit && (
+        <AuditLogModal
+          billId={selectedBillForAudit}
+          onClose={() => setSelectedBillForAudit(null)}
+        />
+      )}
     </div>
   );
 }

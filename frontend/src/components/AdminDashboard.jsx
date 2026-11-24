@@ -1,1004 +1,1204 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { jsPDF } from 'jspdf';
-import axios from 'axios';
 import { backendApi } from '../services/api';
 
-export default function AdminDashboard({ user }) {
+const ALL_ROLES = [
+  { value: 'STUDENT_COORDINATOR', label: 'Student Coordinator' },
+  { value: 'STUDENT_HEAD', label: 'Student Head' },
+  { value: 'FACULTY', label: 'Faculty Head' },
+  { value: 'MAIN_EVENT_HEAD', label: 'Main Event Head' },
+  { value: 'PRINCIPAL', label: 'Principal' },
+  { value: 'STOREKEEPER', label: 'Storekeeper' },
+  { value: 'ACCOUNTS', label: 'Accounts Section' },
+  { value: 'ADMIN', label: 'Admin' },
+];
+
+const DEPARTMENTS = [
+  'Computer Engineering',
+  'Information Technology',
+  'Mechanical Engineering',
+  'Electrical Engineering',
+  'Civil Engineering',
+  'Electronics & Telecommunication',
+  'MCA',
+  'MTech',
+  'Institutional',
+];
+
+const MASTER_CATEGORIES = [
+  'Technical Fest',
+  'Cultural Fest',
+  'Sports Fest',
+  'Departmental Event',
+  'Other',
+];
+
+const formatDateDDMMYYYY = (date = new Date()) => {
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+};
+
+const toIsoInputDate = (ddmmyyyy) => {
+  if (typeof ddmmyyyy === 'string') {
+    const parts = ddmmyyyy.split('-');
+    if (parts.length === 3 && parts[2].length === 4) {
+      return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+  }
+  return new Date().toISOString().split('T')[0];
+};
+
+const fromIsoInputDate = (isoStr) => {
+  if (!isoStr || typeof isoStr !== 'string') return formatDateDDMMYYYY(new Date());
+  const parts = isoStr.split('-');
+  if (parts.length === 3 && parts[0].length === 4) {
+    return `${parts[2].padStart(2, '0')}-${parts[1].padStart(2, '0')}-${parts[0]}`;
+  }
+  return isoStr;
+};
+
+const extractYearFromEvent = (ev) => {
+  if (
+    ev?.eventYear !== null &&
+    ev?.eventYear !== undefined &&
+    !Number.isNaN(Number(ev.eventYear))
+  ) {
+    return Number(ev.eventYear);
+  }
+  if (typeof ev?.createdDate === 'string') {
+    const parts = ev.createdDate.split('-');
+    if (
+      parts.length === 3 &&
+      parts[2].length === 4 &&
+      !Number.isNaN(Number(parts[2]))
+    ) {
+      return Number(parts[2]);
+    }
+  }
+  return 0;
+};
+
+const parseIdList = (raw) => {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((x) => Number(x)).filter((n) => !Number.isNaN(n) && n > 0);
+  }
+  return String(raw)
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => !Number.isNaN(n) && n > 0);
+};
+
+export default function AdminDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  // Role Normalization
-  const normalizedRole = (user?.role || '').toUpperCase();
-  const isStorekeeper = normalizedRole === 'STOREKEEPER' || normalizedRole === 'STORE';
-  const roleTitle = isStorekeeper ? 'Storekeeper Verification Desk' : 'Executive Sanctioning Portal (Principal)';
+  const todayStr = useMemo(() => formatDateDDMMYYYY(new Date()), []);
+  const todayIso = useMemo(() => new Date().toISOString().split('T')[0], []);
 
-  // Tabs & Navigation
-  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders', 'Queue', 'Ledger'
-  const [bills, setBills] = useState([]);
-  const [subEvents, setSubEvents] = useState([]);
-  const [masterEvent, setMasterEvent] = useState(null);
+  const [activeTab, setActiveTab] = useState('users'); // 'users' | 'master' | 'profile'
+  const [users, setUsers] = useState([]);
+  const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState({ type: '', text: '' });
 
-  // Folder View State
-  const [selectedFolder, setSelectedFolder] = useState(null);
-  const [loadingFolder, setLoadingFolder] = useState(false);
+  // Users tab state (Department is mandatory for every role)
+  const [roleFilter, setRoleFilter] = useState('ALL');
+  const [newUser, setNewUser] = useState({
+    name: '',
+    username: '',
+    password: '',
+    institutionalId: '',
+    role: 'STUDENT_COORDINATOR',
+    department: 'Computer Engineering',
+  });
 
-  // Filter & Search States
-  const [statusFilter, setStatusFilter] = useState('All');
-  const [searchTerm, setSearchTerm] = useState('');
+  // Master Event tab state (manual creation date + multiple Main Event Heads & Student Heads)
+  const [newMaster, setNewMaster] = useState({
+    name: '',
+    wingName: 'Technical Fest',
+    budgetCap: '',
+    createdDateIso: todayIso,
+    mainHeadIds: [],
+    studentHeadIds: [],
+  });
+  const [editingMaster, setEditingMaster] = useState(null);
 
-  // Modals & Action State
-  const [selectedBill, setSelectedBill] = useState(null);
-  const [auditRemark, setAuditRemark] = useState('');
-  const [showRejectModal, setShowRejectModal] = useState(false);
-  const [rejectionReason, setRejectionReason] = useState('Budget quota exceeded');
-  const [actionLoading, setActionLoading] = useState(false);
+  const showMessage = (type, text) => {
+    setFeedback({ type, text });
+    setTimeout(() => {
+      setFeedback((prev) =>
+        prev.text === text ? { type: '', text: '' } : prev
+      );
+    }, 5000);
+  };
 
-  // 1. Fetch live bills, master event, and sub-events from Spring Boot
-  const fetchData = async () => {
+  const fetchAllData = async () => {
     setLoading(true);
     try {
-      const [billsRes, eventsRes] = await Promise.all([
-        backendApi.get('/bills').catch(() => ({ data: [] })),
-        backendApi.get('/events').catch(() => axios.get('http://localhost:8080/api/subevents').catch(() => ({ data: [] }))),
+      const [usersRes, eventsRes] = await Promise.all([
+        backendApi.get('/users'),
+        backendApi.get('/events'),
       ]);
-
-      const allEvents = Array.isArray(eventsRes.data) ? eventsRes.data : [];
-      const foundMaster = allEvents.find((ev) => ev.parentEventId === null || ev.parentEventId === undefined);
-      const foundSubs = allEvents.filter((ev) => ev.parentEventId !== null && ev.parentEventId !== undefined);
-
-      setMasterEvent(foundMaster || null);
-      setSubEvents(foundSubs.length > 0 ? foundSubs : allEvents);
-      setBills(Array.isArray(billsRes.data) ? billsRes.data : []);
-    } catch (error) {
-      console.error('Failed to sync data:', error);
+      setUsers(Array.isArray(usersRes.data) ? usersRes.data : []);
+      setEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
+    } catch (err) {
+      console.error('Admin sync error:', err);
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to sync data from backend.'
+      );
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchData();
+    fetchAllData();
   }, []);
 
-  // 2. Open Sub-Event Folder & retrieve assigned faculty/coordinators
-  const openFolderDetails = async (subEventId) => {
-    setLoadingFolder(true);
+  const masterEvents = useMemo(() => {
+    return events
+      .filter((ev) => ev.parentEventId === null || ev.parentEventId === undefined)
+      .slice()
+      .sort((a, b) => {
+        const yearDiff = extractYearFromEvent(b) - extractYearFromEvent(a);
+        if (yearDiff !== 0) return yearDiff;
+        return Number(b.id || 0) - Number(a.id || 0);
+      });
+  }, [events]);
+
+  const subEvents = useMemo(
+    () =>
+      events.filter(
+        (ev) => ev.parentEventId !== null && ev.parentEventId !== undefined
+      ),
+    [events]
+  );
+
+  const mainEventHeads = users.filter(
+    (u) => (u.role || '').toUpperCase() === 'MAIN_EVENT_HEAD'
+  );
+  const studentHeads = users.filter(
+    (u) => (u.role || '').toUpperCase() === 'STUDENT_HEAD'
+  );
+
+  const filteredUsers =
+    roleFilter === 'ALL'
+      ? users
+      : users.filter((u) => (u.role || '').toUpperCase() === roleFilter);
+
+  const getMainHeadNames = (ev) => {
+    const listIds = parseIdList(ev?.mainHeadIds);
+    const ids =
+      listIds.length > 0
+        ? listIds
+        : ev?.mainHeadId
+        ? [Number(ev.mainHeadId)]
+        : [];
+    if (ids.length === 0) return 'Unassigned';
+    return ids
+      .map((id) => {
+        const found = users.find((u) => Number(u.id) === id);
+        return found ? `${found.name} (${found.username})` : `#${id}`;
+      })
+      .join(', ');
+  };
+
+  const getStudentHeadNames = (rawIds) => {
+    const ids = parseIdList(rawIds);
+    if (ids.length === 0) return 'Unassigned';
+    return ids
+      .map((id) => {
+        const found = users.find((u) => Number(u.id) === id);
+        return found ? found.name : `#${id}`;
+      })
+      .join(', ');
+  };
+
+  const toggleIdSelection = (list, id) => {
+    const numId = Number(id);
+    return list.includes(numId)
+      ? list.filter((item) => item !== numId)
+      : [...list, numId];
+  };
+
+  // --- User Handlers ---
+  const handleRoleChange = (role) => {
+    const institutionalRoles = ['PRINCIPAL', 'STOREKEEPER', 'ACCOUNTS', 'ADMIN'];
+    setNewUser((prev) => ({
+      ...prev,
+      role,
+      department: institutionalRoles.includes(role)
+        ? 'Institutional'
+        : prev.department || 'Computer Engineering',
+    }));
+  };
+
+  const handleCreateUser = async (e) => {
+    e.preventDefault();
+    if (newUser.password.length < 4) {
+      showMessage('error', 'Password must be at least 4 characters long.');
+      return;
+    }
+    if (!newUser.department) {
+      showMessage('error', 'Please select a Department for the user.');
+      return;
+    }
+
+    setSubmitting(true);
     try {
-      const res = await axios.get(`http://localhost:8080/api/subevents/${subEventId}`);
-      setSelectedFolder(res.data);
+      const payload = {
+        name: newUser.name.trim(),
+        username: newUser.username.trim(),
+        password: newUser.password,
+        institutionalId: newUser.institutionalId.trim(),
+        role: newUser.role,
+        department: newUser.department,
+      };
+      await backendApi.post('/users', payload);
+      showMessage('success', `User "${payload.username}" created successfully.`);
+      setNewUser({
+        name: '',
+        username: '',
+        password: '',
+        institutionalId: '',
+        role: 'STUDENT_COORDINATOR',
+        department: 'Computer Engineering',
+      });
+      fetchAllData();
     } catch (err) {
-      alert('Failed to load sub-event folder particulars');
+      console.error('Create user error:', err);
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to create user.'
+      );
     } finally {
-      setLoadingFolder(false);
+      setSubmitting(false);
     }
   };
 
-  const closeModals = () => {
-    setSelectedBill(null);
-    setShowRejectModal(false);
-    setAuditRemark('');
-  };
-
-  // PRINCIPAL APPROVAL: PENDING_PRINCIPAL -> PENDING_STOREKEEPER
-  const handlePrincipalApprove = async () => {
-    if (!selectedBill) return;
-    setActionLoading(true);
-    try {
-      await backendApi.put(`/bills/${selectedBill.id}/status`, {
-        status: 'APPROVED', // Advances pipeline to next stage
-        remark: auditRemark || 'Executive financial sanction granted by Principal. Forwarded to Storekeeper.',
-      });
-      alert(`Bill #${selectedBill.billNo} sanctioned and forwarded to Storekeeper for ledger logging!`);
-      closeModals();
-      fetchData();
-      if (selectedFolder) openFolderDetails(selectedFolder.id);
-    } catch (error) {
-      console.error('Principal sanction failed:', error);
-      alert(error.response?.data?.message || 'Failed to sanction bill.');
-    } finally {
-      setActionLoading(false);
+  const handleDeleteUser = async (targetUser) => {
+    if (String(targetUser.id) === String(user?.id)) {
+      showMessage('error', 'You cannot delete your own active admin account.');
+      return;
     }
-  };
-
-  // STOREKEEPER APPROVAL: PENDING_STOREKEEPER -> APPROVED
-  const handleStorekeeperApprove = async () => {
-    if (!selectedBill) return;
-    setActionLoading(true);
-    try {
-      await backendApi.put(`/bills/${selectedBill.id}/status`, {
-        status: 'APPROVED',
-        remark: auditRemark || 'Physical inventory verified and logged in store register book.',
-      });
-      alert(`Bill #${selectedBill.billNo} recorded in stock book and granted FINAL APPROVAL!`);
-      closeModals();
-      fetchData();
-      if (selectedFolder) openFolderDetails(selectedFolder.id);
-    } catch (error) {
-      console.error('Storekeeper logging failed:', error);
-      alert(error.response?.data?.message || 'Failed to record bill.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  // REJECTION HANDLER WITH REASON & ROLE TRACKING
-  const handleConfirmReject = async () => {
-    if (!selectedBill) return;
-    setActionLoading(true);
-    try {
-      await backendApi.put(`/bills/${selectedBill.id}/status`, {
-        status: 'REJECTED',
-        remark: auditRemark || 'Disapproved during audit review',
-        rejectionReason: rejectionReason,
-        rejectedBy: isStorekeeper ? 'STOREKEEPER' : 'PRINCIPAL',
-      });
-      alert(`Bill #${selectedBill.billNo} disapproved and kicked back to Event Coordinator.`);
-      closeModals();
-      fetchData();
-      if (selectedFolder) openFolderDetails(selectedFolder.id);
-    } catch (error) {
-      console.error('Rejection failed:', error);
-      alert(error.response?.data?.message || 'Failed to record rejection.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  // Single Bill Duplex Audit Voucher PDF Generator
-  const generateVoucherPdf = (bill) => {
-    const doc = new jsPDF();
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(16);
-    doc.text('GOVERNMENT COLLEGE OF ENGINEERING', 105, 20, { align: 'center' });
-    doc.setFontSize(11);
-    doc.text('WINGS TECHNICAL FEST - AUDIT CERTIFICATION', 105, 28, { align: 'center' });
-    doc.line(15, 32, 195, 32);
-
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
-    doc.text(`Voucher ID: BS-AUD-${bill.id}`, 16, 42);
-    doc.text(`Invoice No: ${bill.billNo || 'N/A'}`, 130, 42);
-    doc.text(`Vendor: ${bill.vendorName}`, 16, 50);
-    doc.text(`Date: ${bill.billDate || 'N/A'}`, 130, 50);
-    doc.text(`Event Folder: ${bill.eventName || 'Wings Fest'}`, 16, 58);
-    doc.text(`Workflow Stage: ${bill.status}`, 130, 58);
-
-    doc.rect(15, 66, 180, 42);
-    doc.setFont('helvetica', 'bold');
-    doc.text('FINANCIAL AUDIT PARTICULARS', 20, 74);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Taxable Base: Rs. ${Number(bill.baseAmount || bill.amount).toFixed(2)}`, 20, 84);
-    doc.text(`Tax (CGST+SGST): Rs. ${(Number(bill.cgst || 0) + Number(bill.sgst || 0)).toFixed(2)}`, 110, 84);
-    doc.setFont('helvetica', 'bold');
-    doc.text(`Grand Total Amount: Rs. ${Number(bill.amount).toFixed(2)}`, 20, 96);
-    doc.text(`Cumulative Spend Position: Rs. ${(bill.runningTotal || bill.amount).toFixed(2)}`, 110, 96);
-
-    doc.save(`Certified_Voucher_${bill.billNo || bill.id}.pdf`);
-  };
-
-  // COMPREHENSIVE MASTER EVENT FOLDER PDF EXPORT
-  const generateMasterEventPdf = () => {
-    const doc = new jsPDF();
-    const festName = masterEvent ? (masterEvent.name || masterEvent.wingName) : 'WINGS Master Event Portfolio';
-    
-    doc.setFillColor(46, 16, 101);
-    doc.rect(0, 0, 210, 35, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(18);
-    doc.setFont('helvetica', 'bold');
-    doc.text('BILLSTACK MASTER EVENT AUDIT FOLDER', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Master Event: ${festName} | Generated: ${new Date().toLocaleDateString()}`, 14, 27);
-
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(12);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Master Event Financial Overview', 14, 45);
-
-    const totalBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-    const totalSpent = bills.filter(b => b.status === 'APPROVED').reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-
-    doc.autoTable({
-      startY: 50,
-      head: [['Master Event Title', 'Total Sanctioned Budget', 'Total Approved Spend', 'Status']],
-      body: [
-        [festName, `Rs. ${totalBudget?.toLocaleString('en-IN')}`, `Rs. ${totalSpent?.toLocaleString('en-IN')}`, masterEvent?.status || 'ACTIVE']
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [76, 29, 149] }
-    });
-
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Nested Sub-Events Breakdown', 14, currentY);
-
-    const subEventRows = subEvents.map((s) => [
-      `#${s.id}`,
-      s.name,
-      s.department,
-      `Rs. ${s.budgetCap?.toLocaleString('en-IN')}`,
-      `Rs. ${s.totalSpent?.toLocaleString('en-IN') || 0}`
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['ID', 'Sub-Event Name', 'Department', 'Budget Cap', 'Spent to Date']],
-      body: subEventRows,
-      theme: 'grid',
-      headStyles: { fillColor: [76, 29, 149] }
-    });
-
-    currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('3. Itemized Bills Ledger (All Sub-Events)', 14, currentY);
-
-    const billRows = bills.map((b) => [
-      `#${b.billNo || b.id}`,
-      b.vendorName || 'N/A',
-      b.eventName || 'General',
-      `Rs. ${Number(b.amount).toFixed(2)}`,
-      b.status
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Invoice No', 'Vendor', 'Sub-Event / Event', 'Amount', 'Status']],
-      body: billRows,
-      theme: 'striped',
-      headStyles: { fillColor: [76, 29, 149] }
-    });
-
-    doc.save(`${festName.replace(/\s+/g, '_')}_Master_Audit_Folder.pdf`);
-  };
-
-  // INDIVIDUAL SUB-EVENT FOLDER PDF EXPORT
-  const generateSubEventPdf = (sub) => {
-    const doc = new jsPDF();
-    const folderBills = bills.filter(
-      (b) =>
-        (b.subEventId && String(b.subEventId) === String(sub.id)) ||
-        (b.eventName && b.eventName.toLowerCase().trim() === sub.name.toLowerCase().trim())
-    );
-    const subSpent = folderBills.reduce((acc, b) => acc + (Number(b.amount) || 0), 0);
-
-    doc.setFillColor(30, 41, 59);
-    doc.rect(0, 0, 210, 35, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(16);
-    doc.setFont('helvetica', 'bold');
-    doc.text('SUB-EVENT AUDIT PORTFOLIO FOLDER', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Sub-Event: ${sub.name} (${sub.department}) | ID: #${sub.id}`, 14, 27);
-
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(12);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Sub-Event Financial Summary', 14, 45);
-
-    doc.autoTable({
-      startY: 50,
-      head: [['Department', 'Sanctioned Budget', 'Advance Disbursed', 'Total Spent', 'Balance']],
-      body: [
-        [
-          sub.department,
-          `Rs. ${sub.budgetCap?.toLocaleString('en-IN')}`,
-          `Rs. ${sub.advanceDisbursed?.toLocaleString('en-IN') || 0}`,
-          `Rs. ${subSpent.toLocaleString('en-IN')}`,
-          `Rs. ${(sub.budgetCap - subSpent).toLocaleString('en-IN')}`
-        ]
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [51, 65, 85] }
-    });
-
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Itemized Bills under this Folder', 14, currentY);
-
-    const bRows = folderBills.map((b) => [
-      `#${b.billNo || b.id}`,
-      b.vendorName || 'N/A',
-      b.billDate || 'N/A',
-      `Rs. ${Number(b.amount).toFixed(2)}`,
-      b.status
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Invoice No', 'Vendor', 'Date', 'Amount', 'Status']],
-      body: bRows,
-      theme: 'grid',
-      headStyles: { fillColor: [51, 65, 85] }
-    });
-
-    doc.save(`SubEvent_${sub.name.replace(/\s+/g, '_')}_Audit_Folder.pdf`);
-  };
-
-  // Metric Computations
-  const totalFestBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-  const totalFestAdvance = subEvents.reduce((acc, s) => acc + (Number(s.advanceDisbursed) || 0), 0);
-  const totalSanctionedOutflow = bills
-    .filter((b) => b.status === 'APPROVED' || b.status === 'PENDING_STOREKEEPER')
-    .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
-
-  // Queue separation
-  const pendingPrincipalBills = bills.filter((b) => b.status === 'PENDING_PRINCIPAL');
-  const pendingStorekeeperBills = bills.filter((b) => b.status === 'PENDING_STOREKEEPER');
-  const activeQueueBills = isStorekeeper ? pendingStorekeeperBills : pendingPrincipalBills;
-
-  // Filtered Master Bills
-  const filteredMasterBills = bills.filter((b) => {
-    const matchesStatus = statusFilter === 'All' ? true : b.status === statusFilter;
-    const matchesSearch =
-      b.vendorName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.billNo?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.eventName?.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesStatus && matchesSearch;
-  });
-
-  // Folder-Scoped Bills
-  const folderBills = selectedFolder
-    ? bills.filter(
-        (b) =>
-          (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) ||
-          (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())
+    if (
+      !window.confirm(
+        `Delete user "${targetUser.name}" (${targetUser.username})?`
       )
-    : [];
+    ) {
+      return;
+    }
+    try {
+      await backendApi.delete(`/users/${targetUser.id}`);
+      showMessage('success', `User "${targetUser.username}" deleted.`);
+      fetchAllData();
+    } catch (err) {
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to delete user.'
+      );
+    }
+  };
+
+  // --- Master Event Handlers ---
+  const handleCreateMasterEvent = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      const formattedDate = fromIsoInputDate(newMaster.createdDateIso || todayIso);
+      const yearParts = formattedDate.split('-');
+      const selectedYear =
+        yearParts.length === 3 && !Number.isNaN(Number(yearParts[2]))
+          ? Number(yearParts[2])
+          : new Date().getFullYear();
+
+      const payload = {
+        name: newMaster.name.trim(),
+        wingName: newMaster.wingName,
+        budgetCap: parseFloat(newMaster.budgetCap) || 0,
+        parentEventId: null,
+        mainHeadId:
+          newMaster.mainHeadIds.length > 0
+            ? Number(newMaster.mainHeadIds[0])
+            : null,
+        mainHeadIds: newMaster.mainHeadIds.join(','),
+        studentHeadIds: newMaster.studentHeadIds.join(','),
+        createdDate: formattedDate,
+        eventYear: selectedYear,
+        department: null,
+        status: 'ACTIVE',
+      };
+      await backendApi.post('/events', payload);
+      showMessage(
+        'success',
+        `Master event "${payload.name}" created (${formattedDate}). Assigned heads can now manage it.`
+      );
+      setNewMaster({
+        name: '',
+        wingName: 'Technical Fest',
+        budgetCap: '',
+        createdDateIso: todayIso,
+        mainHeadIds: [],
+        studentHeadIds: [],
+      });
+      fetchAllData();
+    } catch (err) {
+      console.error('Create master event error:', err);
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to create master event.'
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSaveMasterEdit = async (e) => {
+    e.preventDefault();
+    if (!editingMaster) return;
+    setSubmitting(true);
+    try {
+      const formattedDate = fromIsoInputDate(
+        editingMaster.createdDateIso || toIsoInputDate(editingMaster.createdDate)
+      );
+      const yearParts = formattedDate.split('-');
+      const selectedYear =
+        yearParts.length === 3 && !Number.isNaN(Number(yearParts[2]))
+          ? Number(yearParts[2])
+          : extractYearFromEvent(editingMaster) || new Date().getFullYear();
+
+      const mainIds = editingMaster.mainHeadIds || [];
+
+      await backendApi.put(`/events/${editingMaster.id}`, {
+        name: editingMaster.name.trim(),
+        wingName: editingMaster.wingName,
+        budgetCap: parseFloat(editingMaster.budgetCap) || 0,
+        mainHeadId: mainIds.length > 0 ? Number(mainIds[0]) : null,
+        mainHeadIds: mainIds.join(','),
+        studentHeadIds: (editingMaster.studentHeadIds || []).join(','),
+        createdDate: formattedDate,
+        eventYear: selectedYear,
+        status: editingMaster.status || 'ACTIVE',
+      });
+      showMessage('success', `Master event "${editingMaster.name}" updated.`);
+      setEditingMaster(null);
+      fetchAllData();
+    } catch (err) {
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to update master event.'
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSignOut = () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    if (typeof onLogout === 'function') onLogout();
+    navigate('/', { replace: true });
+  };
+
+  const inputClass =
+    'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
+
+  const navItems = [
+    { id: 'users', label: 'Users', count: users.length },
+    { id: 'master', label: 'Master Events', count: masterEvents.length },
+    { id: 'profile', label: 'Profile' },
+  ];
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex font-sans">
-      {/* Sidebar */}
-      <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between p-6 shrink-0">
-        <div className="space-y-6">
+    <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
+      <header className="bg-white border-b border-sage-200 sticky top-0 z-30">
+        <div className="px-6 py-3.5 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-xl font-black text-white shadow-lg">
-              B
-            </div>
-            <div>
-              <span className="text-xl font-black tracking-wider text-indigo-400">BillStack</span>
-              <span className="block bg-indigo-900/60 border border-indigo-700 text-indigo-300 text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider w-fit mt-0.5">
-                {isStorekeeper ? 'Storekeeper' : 'Principal'}
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-sage-900">
+                BillStack
               </span>
+              <span className="text-stone-300">/</span>
+              <h1 className="text-sm font-medium text-stone-700">
+                Admin Portal
+              </h1>
             </div>
           </div>
 
-          <nav className="space-y-1.5 pt-4">
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-medium text-stone-800 hidden sm:inline">
+              {user?.name || user?.username || 'Admin'}
+            </span>
             <button
-              onClick={() => setActiveTab('Folders')}
-              className={`w-full text-left px-4 py-3 rounded-xl text-xs font-bold transition flex items-center justify-between ${
-                activeTab === 'Folders' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-              }`}
+              onClick={fetchAllData}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
             >
-              <span className="flex items-center gap-3">
-                <span>📁</span> Sub-Event Folders
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-extrabold">
-                {subEvents.length}
-              </span>
+              Refresh
             </button>
+            <button
+              onClick={handleSignOut}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </header>
 
-            <button
-              onClick={() => setActiveTab('Queue')}
-              className={`w-full text-left px-4 py-3 rounded-xl text-xs font-bold transition flex items-center justify-between ${
-                activeTab === 'Queue' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-              }`}
-            >
-              <span className="flex items-center gap-3">
-                <span>⚡</span> {isStorekeeper ? 'Storekeeper Queue' : 'Principal Queue'}
-              </span>
-              <span className={`text-[10px] px-2 py-0.5 rounded-full font-extrabold ${
-                activeQueueBills.length > 0 ? 'bg-amber-400 text-slate-950 animate-pulse' : 'bg-slate-800 text-slate-400'
-              }`}>
-                {activeQueueBills.length}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('Ledger')}
-              className={`w-full text-left px-4 py-3 rounded-xl text-xs font-bold transition flex items-center justify-between ${
-                activeTab === 'Ledger' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-              }`}
-            >
-              <span className="flex items-center gap-3">
-                <span>📑</span> Master Bills Ledger
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 font-extrabold">
-                {bills.length}
-              </span>
-            </button>
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 bg-white border-r border-sage-200 p-4 shrink-0 hidden md:block">
+          <nav className="space-y-1.5">
+            {navItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
+                  activeTab === item.id
+                    ? 'bg-sage-100 text-sage-900 border border-sage-200'
+                    : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
+                }`}
+              >
+                <span>{item.label}</span>
+                {item.count !== undefined && (
+                  <span className="text-xs px-2 py-0.5 rounded-md bg-white border border-sage-200 text-stone-600">
+                    {item.count}
+                  </span>
+                )}
+              </button>
+            ))}
           </nav>
-        </div>
+        </aside>
 
-        <div className="pt-6 border-t border-slate-800">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-8 h-8 rounded-full bg-indigo-700 flex items-center justify-center text-sm font-bold text-white">
-              {user?.name ? user.name[0].toUpperCase() : 'P'}
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto">
+          <div className="max-w-6xl mx-auto space-y-6">
+            {/* Mobile Nav */}
+            <div className="flex gap-2 overflow-x-auto pb-1 md:hidden">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-medium shrink-0 transition cursor-pointer ${
+                    activeTab === item.id
+                      ? 'bg-sage-600 text-white'
+                      : 'bg-white border border-sage-200 text-stone-600'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
             </div>
-            <div className="overflow-hidden">
-              <p className="text-xs font-bold truncate text-slate-200">{user?.name || 'Dr. Principal'}</p>
-              <p className="text-[10px] text-slate-400 truncate">{isStorekeeper ? 'STOREKEEPER' : 'PRINCIPAL'}</p>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              localStorage.clear();
-              navigate('/');
-            }}
-            className="w-full py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-xs font-bold text-slate-300 transition"
-          >
-            Sign Out
-          </button>
-        </div>
-      </aside>
 
-      {/* Main Workspace */}
-      <main className="flex-1 p-8 overflow-y-auto max-w-6xl">
-        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-slate-800">
-          <div>
-            <h1 className="text-2xl font-black text-white tracking-tight">{roleTitle}</h1>
-            <p className="text-xs text-slate-400 mt-1">
-              {isStorekeeper
-                ? 'Review Principal-sanctioned bills, enter stock book records, and download event folders.'
-                : 'Sub-event folder auditing: Grant executive financial sanction or return bills with feedback.'}
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={generateMasterEventPdf}
-              className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-bold text-white shadow-md transition flex items-center gap-1.5"
-            >
-              📥 Download Master Event Folder (PDF)
-            </button>
-            <button
-              onClick={fetchData}
-              className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-bold text-slate-200 shadow-sm transition"
-            >
-              ↻ Sync
-            </button>
-          </div>
-        </header>
-
-        {/* 4 Real-Time Executive Metric Cards */}
-        <section className="grid grid-cols-1 sm:grid-cols-4 gap-4 mt-6">
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Fest Budget</p>
-            <p className="text-2xl font-black text-white mt-1">₹{totalFestBudget.toLocaleString('en-IN')}</p>
-            <p className="text-[10px] text-slate-400 mt-1">{subEvents.length} Active Sub-Events</p>
-          </div>
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Advances Disbursed</p>
-            <p className="text-2xl font-black text-amber-400 mt-1">₹{totalFestAdvance.toLocaleString('en-IN')}</p>
-            <p className="text-[10px] text-slate-400 mt-1">Physical cash handed out</p>
-          </div>
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-              {isStorekeeper ? 'Storekeeper Queue' : 'Pending Sanction'}
-            </p>
-            <p className="text-2xl font-black text-indigo-400 mt-1">{activeQueueBills.length}</p>
-            <p className="text-[10px] text-slate-400 mt-1">Awaiting your authorization</p>
-          </div>
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Sanctioned Outflow</p>
-            <p className="text-2xl font-black text-emerald-400 mt-1">₹{totalSanctionedOutflow.toLocaleString('en-IN')}</p>
-            <p className="text-[10px] text-slate-400 mt-1">Approved against fest allocation</p>
-          </div>
-        </section>
-
-        {/* ─── TAB 1: SUB-EVENT FOLDERS ─── */}
-        {activeTab === 'Folders' && (
-          <section className="mt-8 space-y-4">
-            <div className="flex justify-between items-center">
-              <div>
-                <h2 className="text-base font-black text-slate-100 flex items-center gap-2">
-                  <span>📁</span> Sub-Event Folders & Budgets ({subEvents.length})
-                </h2>
-                <p className="text-xs text-slate-400">Click any folder to inspect particulars or download its individual PDF folder.</p>
+            {feedback.text && (
+              <div
+                className={`px-4 py-3 rounded-lg border text-xs font-medium ${
+                  feedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : 'bg-sage-100 border-sage-200 text-sage-900'
+                }`}
+              >
+                {feedback.text}
               </div>
-            </div>
+            )}
 
-            {loading ? (
-              <div className="p-12 text-center text-xs font-bold text-slate-400">Loading sub-event folders...</div>
-            ) : subEvents.length === 0 ? (
-              <div className="p-12 text-center bg-slate-800/40 border border-slate-800 rounded-2xl text-slate-400 text-xs">
-                No sub-events found. They must be provisioned by the Student Head.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-                {subEvents.map((evt) => {
-                  const pendingCountInEvent = bills.filter(
-                    (b) =>
-                      b.status === 'PENDING_PRINCIPAL' &&
-                      ((b.subEventId && String(b.subEventId) === String(evt.id)) ||
-                        (b.eventName && b.eventName.toLowerCase().trim() === evt.name.toLowerCase().trim()))
-                  ).length;
-                  const remaining = (evt.budgetCap || 0) - (evt.totalSpent || 0);
+            {/* USERS TAB */}
+            {activeTab === 'users' && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                <section className="lg:col-span-4 bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                  <h2 className="text-base font-semibold text-stone-900 mb-4 pb-3 border-b border-sage-100">
+                    Create User Account
+                  </h2>
+                  <form onSubmit={handleCreateUser} className="space-y-3.5">
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Full Name *
+                      </label>
+                      <input
+                        type="text"
+                        value={newUser.name}
+                        onChange={(e) =>
+                          setNewUser({ ...newUser, name: e.target.value })
+                        }
+                        placeholder="e.g., Riya Kulkarni"
+                        required
+                        className={inputClass}
+                      />
+                    </div>
 
-                  return (
-                    <div
-                      key={evt.id}
-                      className="bg-slate-800/60 border border-slate-700/80 hover:border-indigo-500 rounded-2xl p-5 space-y-4 transition shadow-sm hover:shadow-md flex flex-col justify-between"
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Role *
+                      </label>
+                      <select
+                        value={newUser.role}
+                        onChange={(e) => handleRoleChange(e.target.value)}
+                        className={inputClass}
+                      >
+                        {ALL_ROLES.map((r) => (
+                          <option key={r.value} value={r.value}>
+                            {r.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Department *
+                      </label>
+                      <select
+                        value={newUser.department}
+                        onChange={(e) =>
+                          setNewUser({ ...newUser, department: e.target.value })
+                        }
+                        required
+                        className={inputClass}
+                      >
+                        {DEPARTMENTS.map((d) => (
+                          <option key={d} value={d}>
+                            {d}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        {newUser.role === 'STUDENT_COORDINATOR' ||
+                        newUser.role === 'STUDENT_HEAD'
+                          ? 'Roll Number / Enrollment ID *'
+                          : 'Employee / Staff ID *'}
+                      </label>
+                      <input
+                        type="text"
+                        value={newUser.institutionalId}
+                        onChange={(e) =>
+                          setNewUser({
+                            ...newUser,
+                            institutionalId: e.target.value,
+                          })
+                        }
+                        placeholder="e.g., BT23F06F025 or EMP-101"
+                        required
+                        className={inputClass}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Username *
+                      </label>
+                      <input
+                        type="text"
+                        value={newUser.username}
+                        onChange={(e) =>
+                          setNewUser({ ...newUser, username: e.target.value })
+                        }
+                        placeholder="Login username"
+                        required
+                        className={inputClass}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1">
+                        Password *
+                      </label>
+                      <input
+                        type="password"
+                        value={newUser.password}
+                        onChange={(e) =>
+                          setNewUser({ ...newUser, password: e.target.value })
+                        }
+                        placeholder="Minimum 4 characters"
+                        required
+                        className={inputClass}
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      className="w-full py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer mt-1"
                     >
-                      <div onClick={() => openFolderDetails(evt.id)} className="cursor-pointer">
-                        <div className="flex justify-between items-center mb-2">
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">
-                            {evt.department}
-                          </span>
-                          {pendingCountInEvent > 0 && (
-                            <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-amber-400 text-slate-950 animate-pulse">
-                              {pendingCountInEvent} to sanction
-                            </span>
-                          )}
-                        </div>
-                        <h3 className="text-base font-bold text-white flex items-center gap-2">
-                          <span>📁</span> {evt.name}
-                        </h3>
-                        {evt.description && (
-                          <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{evt.description}</p>
+                      {submitting ? 'Creating...' : 'Create User'}
+                    </button>
+                  </form>
+                </section>
+
+                <section className="lg:col-span-8 bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-sage-100">
+                    <h2 className="text-base font-semibold text-stone-900">
+                      Registered Users ({filteredUsers.length})
+                    </h2>
+                    <select
+                      value={roleFilter}
+                      onChange={(e) => setRoleFilter(e.target.value)}
+                      className="px-3 py-1.5 bg-white border border-sage-200 rounded-lg text-xs font-medium text-stone-700 outline-none focus:border-sage-500"
+                    >
+                      <option value="ALL">All Roles</option>
+                      {ALL_ROLES.map((r) => (
+                        <option key={r.value} value={r.value}>
+                          {r.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {loading ? (
+                    <div className="py-10 text-center text-xs text-stone-500">
+                      Loading users...
+                    </div>
+                  ) : filteredUsers.length === 0 ? (
+                    <div className="py-10 text-center text-xs text-stone-500 bg-sage-50/50 border border-sage-200/80 rounded-lg">
+                      No users found.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                      <table className="w-full text-left text-sm border-collapse">
+                        <thead>
+                          <tr className="bg-sage-50 text-stone-600 text-xs font-medium border-b border-sage-200">
+                            <th className="py-2.5 px-3.5">Name</th>
+                            <th className="py-2.5 px-3.5">Username</th>
+                            <th className="py-2.5 px-3.5">Role</th>
+                            <th className="py-2.5 px-3.5">ID / Dept</th>
+                            <th className="py-2.5 px-3.5 text-center">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-sage-100">
+                          {filteredUsers.map((u) => (
+                            <tr key={u.id} className="hover:bg-sage-50/40">
+                              <td className="py-2.5 px-3.5 font-medium text-stone-900">
+                                {u.name}
+                              </td>
+                              <td className="py-2.5 px-3.5 font-mono text-xs text-stone-600">
+                                {u.username}
+                              </td>
+                              <td className="py-2.5 px-3.5">
+                                <span className="px-2 py-0.5 text-[11px] font-medium bg-sage-50 border border-sage-200 text-sage-800 rounded-md">
+                                  {u.role}
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-3.5 text-xs text-stone-500">
+                                <span className="block font-mono">
+                                  {u.institutionalId}
+                                </span>
+                                <span className="block text-[11px] text-stone-400">
+                                  {u.department || 'Institutional'}
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-3.5 text-center">
+                                <button
+                                  onClick={() => handleDeleteUser(u)}
+                                  className="px-2.5 py-1 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-md text-xs font-medium transition cursor-pointer"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </section>
+              </div>
+            )}
+
+            {/* MASTER EVENTS TAB (Admin creates Master Events only) */}
+            {activeTab === 'master' && (
+              <div className="space-y-6">
+                <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] max-w-2xl">
+                  <h2 className="text-base font-semibold text-stone-900 mb-4 pb-3 border-b border-sage-100">
+                    Create Master Event
+                  </h2>
+                  <form
+                    onSubmit={handleCreateMasterEvent}
+                    className="space-y-4"
+                  >
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Event Title *
+                        </label>
+                        <input
+                          type="text"
+                          value={newMaster.name}
+                          onChange={(e) =>
+                            setNewMaster({ ...newMaster, name: e.target.value })
+                          }
+                          placeholder="e.g., Wings Technical Fest 2026"
+                          required
+                          className={inputClass}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Category
+                        </label>
+                        <select
+                          value={newMaster.wingName}
+                          onChange={(e) =>
+                            setNewMaster({
+                              ...newMaster,
+                              wingName: e.target.value,
+                            })
+                          }
+                          className={inputClass}
+                        >
+                          {MASTER_CATEGORIES.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Budget Cap (INR) *
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newMaster.budgetCap}
+                          onChange={(e) =>
+                            setNewMaster({
+                              ...newMaster,
+                              budgetCap: e.target.value,
+                            })
+                          }
+                          placeholder="e.g., 500000"
+                          required
+                          className={inputClass}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Event Creation Date (Past or Current Year) *
+                        </label>
+                        <input
+                          type="date"
+                          value={newMaster.createdDateIso}
+                          onChange={(e) =>
+                            setNewMaster({
+                              ...newMaster,
+                              createdDateIso: e.target.value,
+                            })
+                          }
+                          required
+                          className={inputClass}
+                        />
+                        <span className="text-[11px] text-stone-400 mt-0.5 block">
+                          Saved as: {fromIsoInputDate(newMaster.createdDateIso || todayStr)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                      <p className="text-xs font-semibold text-stone-700">
+                        Assign Main Event Head(s) ({newMaster.mainHeadIds.length}{' '}
+                        selected)
+                      </p>
+                      <div className="max-h-32 overflow-y-auto space-y-1.5 pr-1">
+                        {mainEventHeads.length === 0 ? (
+                          <p className="text-xs text-stone-400">
+                            No Main Event Heads created yet.
+                          </p>
+                        ) : (
+                          mainEventHeads.map((h) => (
+                            <label
+                              key={h.id}
+                              className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={newMaster.mainHeadIds.includes(
+                                  Number(h.id)
+                                )}
+                                onChange={() =>
+                                  setNewMaster((prev) => ({
+                                    ...prev,
+                                    mainHeadIds: toggleIdSelection(
+                                      prev.mainHeadIds,
+                                      h.id
+                                    ),
+                                  }))
+                                }
+                              />
+                              <span className="font-medium">{h.name}</span>
+                              <span className="text-stone-400 ml-auto font-mono">
+                                {h.username}
+                              </span>
+                            </label>
+                          ))
                         )}
                       </div>
-
-                      <div onClick={() => openFolderDetails(evt.id)} className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/80 space-y-1.5 text-xs cursor-pointer">
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Budget Cap:</span>
-                          <span className="font-bold text-slate-200">₹{evt.budgetCap?.toLocaleString('en-IN')}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Advance Given:</span>
-                          <span className="font-bold text-amber-400">₹{evt.advanceDisbursed?.toLocaleString('en-IN')}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Spent to Date:</span>
-                          <span className="font-bold text-indigo-400">₹{evt.totalSpent?.toLocaleString('en-IN')}</span>
-                        </div>
-                        <div className="flex justify-between pt-1 border-t border-slate-800">
-                          <span className="text-slate-400">Remaining Balance:</span>
-                          <span className={`font-bold ${remaining < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                            ₹{remaining.toLocaleString('en-IN')}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="pt-2 border-t border-slate-700/60 flex justify-between items-center text-xs">
-                        <button
-                          onClick={() => generateSubEventPdf(evt)}
-                          className="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[10px] font-bold transition shadow-sm"
-                        >
-                          📥 Download PDF
-                        </button>
-                        <span onClick={() => openFolderDetails(evt.id)} className="text-indigo-400 font-bold hover:underline cursor-pointer">
-                          Open Folder →
-                        </span>
-                      </div>
                     </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        )}
 
-        {/* ─── TAB 2: ACTIVE AUTHORIZATION QUEUE ─── */}
-        {activeTab === 'Queue' && (
-          <section className="mt-8 space-y-4">
-            <h2 className="text-base font-black text-slate-100 flex items-center gap-2">
-              <span>⚡</span> Pending Sanction Queue ({activeQueueBills.length})
-            </h2>
-
-            {loading ? (
-              <div className="p-12 text-center text-xs font-bold text-slate-400">Loading queue...</div>
-            ) : activeQueueBills.length === 0 ? (
-              <div className="p-12 text-center bg-slate-800/40 border border-slate-800 rounded-2xl text-slate-400 text-xs">
-                ✓ No bills currently pending at this review gate.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {activeQueueBills.map((bill) => (
-                  <div key={bill.id} className="bg-slate-800/80 border border-slate-700 p-5 rounded-2xl space-y-4 shadow-sm">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <span className="text-sm font-bold text-white block">{bill.vendorName}</span>
-                        <span className="text-[11px] font-mono text-indigo-400">Invoice #{bill.billNo}</span>
-                        <p className="text-[10px] text-slate-400 mt-0.5">{bill.eventName} • {bill.billDate}</p>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-base font-black text-white block">₹{Number(bill.amount).toFixed(2)}</span>
-                        <span className="text-[10px] text-slate-400">
-                          Running Total: ₹{(bill.runningTotal || bill.amount).toFixed(2)}
-                        </span>
+                    <div className="p-3.5 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                      <p className="text-xs font-semibold text-stone-700">
+                        Assign Student Head(s) ({newMaster.studentHeadIds.length}{' '}
+                        selected)
+                      </p>
+                      <div className="max-h-32 overflow-y-auto space-y-1.5 pr-1">
+                        {studentHeads.length === 0 ? (
+                          <p className="text-xs text-stone-400">
+                            No Student Heads created yet.
+                          </p>
+                        ) : (
+                          studentHeads.map((sh) => (
+                            <label
+                              key={sh.id}
+                              className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={newMaster.studentHeadIds.includes(
+                                  Number(sh.id)
+                                )}
+                                onChange={() =>
+                                  setNewMaster((prev) => ({
+                                    ...prev,
+                                    studentHeadIds: toggleIdSelection(
+                                      prev.studentHeadIds,
+                                      sh.id
+                                    ),
+                                  }))
+                                }
+                              />
+                              <span className="font-medium">{sh.name}</span>
+                              <span className="text-stone-400 ml-auto font-mono">
+                                {sh.username}
+                              </span>
+                            </label>
+                          ))
+                        )}
                       </div>
                     </div>
 
-                    <div className="p-3 bg-slate-900/60 rounded-xl text-xs space-y-1 text-slate-300">
-                      <p><strong className="text-slate-400">GSTIN:</strong> {bill.vendorGstin || 'Unregistered'}</p>
-                      <p><strong className="text-slate-400">Audit Notes:</strong> {bill.description || 'Verified by Faculty'}</p>
-                    </div>
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      className="px-5 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer"
+                    >
+                      {submitting ? 'Creating...' : 'Create Master Event'}
+                    </button>
+                  </form>
+                </section>
 
-                    <div className="flex gap-2 pt-2 border-t border-slate-700/60">
-                      <button
-                        onClick={() => setSelectedBill(bill)}
-                        className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm"
-                      >
-                        {isStorekeeper ? 'Record in Stock Register' : 'Review & Sanction'}
-                      </button>
-                      <button
-                        onClick={() => {
-                          setSelectedBill(bill);
-                          setShowRejectModal(true);
-                        }}
-                        className="px-3 py-2 bg-rose-900/40 hover:bg-rose-900/80 text-rose-300 border border-rose-700/60 rounded-xl text-xs font-bold transition"
-                      >
-                        Disapprove
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-
-        {/* ─── TAB 3: MASTER BILLS LEDGER ─── */}
-        {activeTab === 'Ledger' && (
-          <section className="mt-8 space-y-4">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-              <h2 className="text-base font-black text-slate-100">Master Financial Record Ledger</h2>
-              <div className="flex items-center gap-3 w-full md:w-auto">
-                <input
-                  type="text"
-                  placeholder="Search vendor, bill ID, or event..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className="bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 w-full md:w-64 outline-none"
-                />
-                <select
-                  value={statusFilter}
-                  onChange={(e) => setStatusFilter(e.target.value)}
-                  className="bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-xs font-bold text-slate-200 outline-none"
-                >
-                  <option value="All">All Statuses</option>
-                  <option value="PENDING_FACULTY">Faculty Review</option>
-                  <option value="PENDING_PRINCIPAL">Principal Sanction</option>
-                  <option value="PENDING_STOREKEEPER">Storekeeper Review</option>
-                  <option value="APPROVED">Approved</option>
-                  <option value="REJECTED">Rejected</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="bg-slate-800/40 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="border-b border-slate-800 bg-slate-950/60 text-slate-400 font-bold uppercase tracking-wider">
-                    <th className="py-3.5 px-4">Invoice No</th>
-                    <th className="py-3.5 px-4">Vendor & Event</th>
-                    <th className="py-3.5 px-4">Amount</th>
-                    <th className="py-3.5 px-4">Running Total</th>
-                    <th className="py-3.5 px-4">Conveyor Status</th>
-                    <th className="py-3.5 px-4 text-center">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800 text-slate-300 font-medium">
-                  {filteredMasterBills.map((b) => (
-                    <tr key={b.id} className="hover:bg-slate-800/40 transition">
-                      <td className="py-3.5 px-4 font-mono font-bold text-indigo-300">#{b.billNo || b.id}</td>
-                      <td className="py-3.5 px-4">
-                        <span className="font-bold text-white block">{b.vendorName}</span>
-                        <span className="text-[10px] text-slate-400">{b.eventName}</span>
-                      </td>
-                      <td className="py-3.5 px-4 font-black text-white">₹{Number(b.amount).toFixed(2)}</td>
-                      <td className="py-3.5 px-4 font-bold text-indigo-400">₹{Number(b.runningTotal || b.amount).toFixed(2)}</td>
-                      <td className="py-3.5 px-4">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
-                          b.status === 'APPROVED' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' :
-                          b.status === 'REJECTED' ? 'bg-rose-950 text-rose-300 border border-rose-800' :
-                          b.status === 'PENDING_PRINCIPAL' ? 'bg-indigo-950 text-indigo-300 border border-indigo-700' :
-                          'bg-amber-950 text-amber-300 border border-amber-800'
-                        }`}>
-                          {b.status}
-                        </span>
-                      </td>
-                      <td className="py-3.5 px-4 text-center">
-                        <button
-                          onClick={() => generateVoucherPdf(b)}
-                          className="px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[11px] font-bold transition shadow-sm"
-                        >
-                          🖨️ PDF
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )}
-
-        {/* ─── MODAL 1: SUB-EVENT FOLDER INSPECTOR ─── */}
-        {selectedFolder && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto">
-              <div className="flex justify-between items-start border-b border-slate-800 pb-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">📁</span>
-                    <h3 className="text-xl font-black text-white">{selectedFolder.name}</h3>
-                    <span className="text-xs font-bold px-2.5 py-0.5 bg-indigo-950 text-indigo-300 border border-indigo-800 rounded-md">
-                      {selectedFolder.department}
+                <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-sage-100">
+                    <h2 className="text-base font-semibold text-stone-900">
+                      Master Events by Year ({masterEvents.length})
+                    </h2>
+                    <span className="text-xs text-stone-500">
+                      Sorted descending by year &middot; Sub-events are created by assigned Student Heads
                     </span>
                   </div>
-                  <p className="text-xs text-slate-400 mt-1">
-                    Lifecycle Status: <strong className="text-emerald-400">{selectedFolder.status}</strong>
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => generateSubEventPdf(selectedFolder)}
-                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow"
-                  >
-                    📥 Download Folder PDF
-                  </button>
-                  <button
-                    onClick={() => setSelectedFolder(null)}
-                    className="text-slate-400 hover:text-white text-2xl font-bold px-2"
-                  >
-                    ✕
-                  </button>
-                </div>
+
+                  {masterEvents.length === 0 ? (
+                    <div className="py-10 text-center text-xs text-stone-500 bg-sage-50/50 border border-sage-200/80 rounded-lg">
+                      No master events created yet.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {masterEvents.map((m) => {
+                        const childCount = subEvents.filter(
+                          (s) => String(s.parentEventId) === String(m.id)
+                        ).length;
+                        const yr = extractYearFromEvent(m);
+                        const existingMainIds =
+                          parseIdList(m.mainHeadIds).length > 0
+                            ? parseIdList(m.mainHeadIds)
+                            : m.mainHeadId
+                            ? [Number(m.mainHeadId)]
+                            : [];
+                        return (
+                          <div
+                            key={m.id}
+                            className="p-5 bg-sage-50/40 border border-sage-200 rounded-xl space-y-3 flex flex-col justify-between"
+                          >
+                            <div className="space-y-2">
+                              <div className="flex justify-between items-center gap-2">
+                                <span className="text-[11px] font-semibold px-2 py-0.5 bg-sage-100 border border-sage-200 text-sage-800 rounded-md">
+                                  {yr || 'Year N/A'} &middot;{' '}
+                                  {m.wingName || 'Event'}
+                                </span>
+                                <span className="text-[11px] font-medium px-2 py-0.5 bg-white border border-sage-200 text-stone-600 rounded-md">
+                                  {m.status || 'ACTIVE'}
+                                </span>
+                              </div>
+                              <h3 className="text-sm font-semibold text-stone-900">
+                                {m.name}
+                              </h3>
+                              <div className="bg-white p-3 rounded-lg border border-sage-100 space-y-1.5 text-xs">
+                                <div className="flex justify-between text-stone-600">
+                                  <span>Created Date</span>
+                                  <span className="font-mono text-stone-800">
+                                    {m.createdDate || '—'}
+                                  </span>
+                                </div>
+                                <div className="flex justify-between text-stone-600">
+                                  <span>Budget</span>
+                                  <span className="font-semibold text-stone-900">
+                                    INR{' '}
+                                    {Number(m.budgetCap || 0).toLocaleString(
+                                      'en-IN'
+                                    )}
+                                  </span>
+                                </div>
+                                <div className="flex justify-between text-stone-600 gap-2">
+                                  <span>Main Head(s)</span>
+                                  <span className="font-medium text-stone-800 truncate max-w-[150px]">
+                                    {getMainHeadNames(m)}
+                                  </span>
+                                </div>
+                                <div className="flex justify-between text-stone-600 gap-2">
+                                  <span>Student Head(s)</span>
+                                  <span className="font-medium text-stone-800 truncate max-w-[150px]">
+                                    {getStudentHeadNames(m.studentHeadIds)}
+                                  </span>
+                                </div>
+                                <div className="flex justify-between text-stone-600">
+                                  <span>Sub-Events</span>
+                                  <span className="font-medium text-stone-800">
+                                    {childCount}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEditingMaster({
+                                  id: m.id,
+                                  name: m.name || '',
+                                  wingName: m.wingName || 'Technical Fest',
+                                  budgetCap: m.budgetCap ?? '',
+                                  mainHeadIds: existingMainIds,
+                                  studentHeadIds: parseIdList(m.studentHeadIds),
+                                  createdDate: m.createdDate || todayStr,
+                                  createdDateIso: toIsoInputDate(
+                                    m.createdDate || todayStr
+                                  ),
+                                  status: m.status || 'ACTIVE',
+                                })
+                              }
+                              className="w-full py-2 bg-white hover:bg-sage-50 border border-sage-200 text-sage-800 text-xs font-medium rounded-lg transition cursor-pointer"
+                            >
+                              Edit Master Event
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
               </div>
+            )}
 
-              {/* Sub-Event Ledger Details */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Sanctioned Budget</span>
-                  <span className="text-base font-black text-white">₹{selectedFolder.budgetCap?.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Cash Advance</span>
-                  <span className="text-base font-black text-amber-400">₹{selectedFolder.advanceDisbursed?.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Total Spent</span>
-                  <span className="text-base font-black text-indigo-400">₹{selectedFolder.totalSpent?.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Remaining Balance</span>
-                  <span className="text-base font-black text-emerald-400">
-                    ₹{(selectedFolder.budgetCap - selectedFolder.totalSpent)?.toLocaleString('en-IN')}
-                  </span>
-                </div>
-              </div>
-
-              {/* Personnel Assignment Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Description / Scope</span>
-                  <p className="text-slate-300 font-medium">{selectedFolder.description || 'No specific description provided.'}</p>
-                </div>
-
-                <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
-                  <div>
-                    <span className="text-slate-400 uppercase text-[10px] font-bold block">Assigned Faculty Head(s):</span>
-                    <p className="text-indigo-300 font-bold mt-0.5">
-                      {selectedFolder.facultyHeads && selectedFolder.facultyHeads.length > 0
-                        ? selectedFolder.facultyHeads.map((f) => `${f.name} (${f.institutionalId})`).join(', ')
-                        : 'Not allotted yet'}
-                    </p>
+            {/* PROFILE TAB */}
+            {activeTab === 'profile' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] max-w-lg space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Profile
+                </h2>
+                <div className="space-y-3 text-sm">
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Full Name</span>
+                    <span className="font-medium text-stone-900">
+                      {user?.name || 'System Admin'}
+                    </span>
                   </div>
-                  <div className="pt-2 border-t border-slate-800">
-                    <span className="text-slate-400 uppercase text-[10px] font-bold block">Assigned Student Coordinator(s):</span>
-                    <p className="text-slate-200 font-bold mt-0.5">
-                      {selectedFolder.coordinators && selectedFolder.coordinators.length > 0
-                        ? selectedFolder.coordinators.map((c) => `${c.name} (${c.institutionalId})`).join(', ')
-                        : 'Not allotted yet'}
-                    </p>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Username</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.username || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Role</span>
+                    <span className="font-medium text-sage-800">
+                      {user?.role || 'ADMIN'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Department</span>
+                    <span className="text-stone-800">
+                      {user?.department || 'Institutional'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2">
+                    <span className="text-stone-500">Institutional ID</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.institutionalId || 'N/A'}
+                    </span>
                   </div>
                 </div>
-              </div>
-
-              {/* Bills Under This Folder */}
-              <div className="space-y-3 pt-2">
-                <h4 className="text-sm font-bold text-white flex items-center gap-2">
-                  <span>📑</span> Bills Uploaded to this Folder ({folderBills.length})
-                </h4>
-
-                {folderBills.length === 0 ? (
-                  <div className="p-8 text-center text-slate-500 bg-slate-950/40 rounded-xl border border-dashed border-slate-800 text-xs">
-                    No bills recorded for this event folder yet.
-                  </div>
-                ) : (
-                  <div className="overflow-x-auto border border-slate-800 rounded-xl">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-slate-950 text-slate-400 font-bold border-b border-slate-800">
-                        <tr>
-                          <th className="py-2.5 px-3">Invoice No</th>
-                          <th className="py-2.5 px-3">Vendor</th>
-                          <th className="py-2.5 px-3">Amount</th>
-                          <th className="py-2.5 px-3">Date</th>
-                          <th className="py-2.5 px-3">Status</th>
-                          <th className="py-2.5 px-3 text-center">Action</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800 text-slate-300">
-                        {folderBills.map((b) => (
-                          <tr key={b.id} className="hover:bg-slate-800/40">
-                            <td className="py-2.5 px-3 font-mono text-indigo-300 font-bold">#{b.billNo}</td>
-                            <td className="py-2.5 px-3 font-semibold text-white">{b.vendorName}</td>
-                            <td className="py-2.5 px-3 font-black text-white">₹{Number(b.amount).toFixed(2)}</td>
-                            <td className="py-2.5 px-3 text-slate-400">{b.billDate}</td>
-                            <td className="py-2.5 px-3">
-                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                b.status === 'PENDING_PRINCIPAL' ? 'bg-indigo-950 text-indigo-300 border border-indigo-700' :
-                                b.status === 'APPROVED' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' :
-                                b.status === 'REJECTED' ? 'bg-rose-950 text-rose-300 border border-rose-800' :
-                                'bg-amber-950 text-amber-300 border border-amber-800'
-                              }`}>
-                                {b.status}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-3 text-center">
-                              {b.status === 'PENDING_PRINCIPAL' && !isStorekeeper ? (
-                                <button
-                                  onClick={() => setSelectedBill(b)}
-                                  className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold shadow-sm"
-                                >
-                                  Sanction
-                                </button>
-                              ) : (
-                                <button
-                                  onClick={() => generateVoucherPdf(b)}
-                                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-[10px] font-bold"
-                                >
-                                  PDF
-                                </button>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            </div>
+              </section>
+            )}
           </div>
-        )}
+        </main>
+      </div>
 
-        {/* ─── MODAL 2: PRINCIPAL / STOREKEEPER SANCTION MODAL ─── */}
-        {selectedBill && !showRejectModal && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-xl rounded-2xl shadow-2xl p-6 space-y-4">
-              <div className="flex justify-between items-start border-b border-slate-800 pb-3">
-                <div>
-                  <h3 className="text-base font-bold text-white">
-                    {isStorekeeper ? 'Storekeeper Verification Gate' : 'Principal Executive Sanction Gate'}
-                  </h3>
-                  <p className="text-xs text-slate-400">Review invoice particulars before advancing on conveyor belt</p>
-                </div>
-                <button onClick={closeModals} className="text-slate-400 hover:text-white text-lg font-bold">✕</button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 bg-slate-950/60 p-4 rounded-xl border border-slate-800 text-xs">
-                <div>
-                  <span className="text-slate-500 font-bold uppercase text-[10px]">Vendor</span>
-                  <p className="font-bold text-white">{selectedBill.vendorName}</p>
-                  <p className="text-slate-400 font-mono text-[10px]">GSTIN: {selectedBill.vendorGstin}</p>
-                </div>
-                <div>
-                  <span className="text-slate-500 font-bold uppercase text-[10px]">Invoice Ref</span>
-                  <p className="font-bold text-white">{selectedBill.billNo}</p>
-                  <p className="text-slate-400 text-[10px]">Date: {selectedBill.billDate}</p>
-                </div>
-                <div>
-                  <span className="text-slate-500 font-bold uppercase text-[10px]">Amount</span>
-                  <p className="text-lg font-black text-emerald-400">₹{Number(selectedBill.amount).toFixed(2)}</p>
-                </div>
-                <div>
-                  <span className="text-slate-500 font-bold uppercase text-[10px]">Folder Running Spend</span>
-                  <p className="text-lg font-black text-indigo-400">
-                    ₹{Number(selectedBill.runningTotal || selectedBill.amount).toFixed(2)}
-                  </p>
-                </div>
-              </div>
-
+      {/* EDIT MASTER EVENT MODAL */}
+      {editingMaster && (
+        <div className="fixed inset-0 bg-stone-900/40 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-sage-200 rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.08)] w-full max-w-md max-h-[90vh] flex flex-col overflow-hidden">
+            <div className="px-6 py-4 border-b border-sage-100 bg-sage-50/60 flex justify-between items-center">
+              <h3 className="text-base font-semibold text-stone-900">
+                Edit Master Event
+              </h3>
+              <button
+                onClick={() => setEditingMaster(null)}
+                className="text-xs font-medium text-stone-500 hover:text-stone-800 cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+            <form
+              onSubmit={handleSaveMasterEdit}
+              className="p-6 overflow-y-auto space-y-4"
+            >
               <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">
-                  {isStorekeeper ? 'Stock Register / Store Ledger Note:' : 'Principal Executive Sanction Remark:'}
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Event Title
                 </label>
-                <textarea
-                  rows={2}
-                  value={auditRemark}
-                  onChange={(e) => setAuditRemark(e.target.value)}
-                  placeholder={
-                    isStorekeeper
-                      ? 'e.g., Logged in Store Register Book Vol 2, Page 14.'
-                      : 'e.g., Sanctioned under Wings Annual Operating Budget.'
+                <input
+                  type="text"
+                  value={editingMaster.name}
+                  onChange={(e) =>
+                    setEditingMaster({ ...editingMaster, name: e.target.value })
                   }
-                  className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 outline-none"
+                  required
+                  className={inputClass}
                 />
               </div>
-
-              <div className="flex justify-end gap-3 pt-2">
+              <div>
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Event Creation Date
+                </label>
+                <input
+                  type="date"
+                  value={editingMaster.createdDateIso || todayIso}
+                  onChange={(e) =>
+                    setEditingMaster({
+                      ...editingMaster,
+                      createdDateIso: e.target.value,
+                    })
+                  }
+                  required
+                  className={inputClass}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-stone-600 mb-1">
+                  Budget Cap (INR)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  value={editingMaster.budgetCap}
+                  onChange={(e) =>
+                    setEditingMaster({
+                      ...editingMaster,
+                      budgetCap: e.target.value,
+                    })
+                  }
+                  required
+                  className={inputClass}
+                />
+              </div>
+              <div className="p-3 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                <p className="text-xs font-semibold text-stone-700">
+                  Main Event Head(s) ({(editingMaster.mainHeadIds || []).length}{' '}
+                  selected)
+                </p>
+                <div className="max-h-28 overflow-y-auto space-y-1.5">
+                  {mainEventHeads.map((h) => (
+                    <label
+                      key={h.id}
+                      className="flex items-center gap-2 text-xs bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={(editingMaster.mainHeadIds || []).includes(
+                          Number(h.id)
+                        )}
+                        onChange={() =>
+                          setEditingMaster((prev) => ({
+                            ...prev,
+                            mainHeadIds: toggleIdSelection(
+                              prev.mainHeadIds || [],
+                              h.id
+                            ),
+                          }))
+                        }
+                      />
+                      <span className="font-medium">{h.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="p-3 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                <p className="text-xs font-semibold text-stone-700">
+                  Student Head(s) ({(editingMaster.studentHeadIds || []).length}{' '}
+                  selected)
+                </p>
+                <div className="max-h-28 overflow-y-auto space-y-1.5">
+                  {studentHeads.map((sh) => (
+                    <label
+                      key={sh.id}
+                      className="flex items-center gap-2 text-xs bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={(editingMaster.studentHeadIds || []).includes(
+                          Number(sh.id)
+                        )}
+                        onChange={() =>
+                          setEditingMaster((prev) => ({
+                            ...prev,
+                            studentHeadIds: toggleIdSelection(
+                              prev.studentHeadIds || [],
+                              sh.id
+                            ),
+                          }))
+                        }
+                      />
+                      <span className="font-medium">{sh.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="flex justify-end gap-2.5 pt-2">
                 <button
-                  onClick={closeModals}
-                  className="px-4 py-2 border border-slate-700 rounded-xl text-xs font-bold text-slate-300 hover:bg-slate-800"
+                  type="button"
+                  onClick={() => setEditingMaster(null)}
+                  className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={() => setShowRejectModal(true)}
-                  className="px-4 py-2 bg-rose-900/60 hover:bg-rose-900 text-rose-200 border border-rose-700 rounded-xl text-xs font-bold"
+                  type="submit"
+                  disabled={submitting}
+                  className="px-4 py-2 bg-sage-600 hover:bg-sage-700 text-white rounded-lg text-xs font-medium cursor-pointer"
                 >
-                  Disapprove
-                </button>
-                <button
-                  onClick={isStorekeeper ? handleStorekeeperApprove : handlePrincipalApprove}
-                  disabled={actionLoading}
-                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-md transition"
-                >
-                  {actionLoading
-                    ? 'Processing...'
-                    : isStorekeeper
-                    ? '✓ Log in Register & Grant Final Approval'
-                    : '✓ Grant Sanction & Forward to Storekeeper'}
+                  {submitting ? 'Saving...' : 'Save Changes'}
                 </button>
               </div>
-            </div>
+            </form>
           </div>
-        )}
-
-        {/* ─── MODAL 3: MANDATORY REJECTION FEEDBACK MODAL ─── */}
-        {showRejectModal && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-md rounded-2xl shadow-2xl p-6 space-y-4">
-              <h3 className="text-base font-bold text-white">Disapproval & Return Loop</h3>
-              <p className="text-xs text-slate-400">Specify why Bill #{selectedBill?.billNo} is being kicked back to the Coordinator.</p>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">Reason for Rejection:</label>
-                <select
-                  value={rejectionReason}
-                  onChange={(e) => setRejectionReason(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white font-medium outline-none"
-                >
-                  <option value="Budget quota exceeded">Budget quota exceeded</option>
-                  <option value="Missing physical receipt in department store">Missing physical receipt in department store</option>
-                  <option value="Discrepancy in recorded ledger items">Discrepancy in recorded ledger items</option>
-                  <option value="Incomplete vendor tax credentials">Incomplete vendor tax credentials</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1">
-                  Additional Remark (Optional):
-                </label>
-                <textarea
-                  rows={2}
-                  value={auditRemark}
-                  onChange={(e) => setAuditRemark(e.target.value)}
-                  placeholder="Add specific notes for correction..."
-                  className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 outline-none"
-                />
-              </div>
-
-              <div className="flex justify-end gap-3 pt-2">
-                <button
-                  onClick={() => setShowRejectModal(false)}
-                  className="px-4 py-2 border border-slate-700 rounded-xl text-xs font-bold text-slate-400 hover:bg-slate-800"
-                >
-                  Back
-                </button>
-                <button
-                  onClick={handleConfirmReject}
-                  disabled={actionLoading}
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-md transition"
-                >
-                  {actionLoading ? 'Processing...' : 'Confirm Disapproval'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </main>
+        </div>
+      )}
     </div>
   );
-}
+} 

@@ -9,7 +9,7 @@ public class Bill {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "bill_id")
+    @Column(name = "id")
     private Long id;
 
     private String vendorName;
@@ -25,6 +25,10 @@ public class Bill {
     private String rejectionReason;
     private String rejectedBy;
 
+    private Long uploadedById;
+    private String uploadedByName;
+    private String uploadedByRole;
+
     @Column(columnDefinition = "TEXT")
     private String description;
 
@@ -33,11 +37,9 @@ public class Bill {
 
     private LocalDateTime createdAt;
 
-    public String getRejectionReason() { return rejectionReason; }
-    public void setRejectionReason(String rejectionReason) { this.rejectionReason = rejectionReason; }
-
-    public String getRejectedBy() { return rejectedBy; }
-    public void setRejectedBy(String rejectedBy) { this.rejectedBy = rejectedBy; }
+    @Lob
+    @Column(name = "receipt_image", columnDefinition = "LONGTEXT")
+    private String receiptImage;
 
     @PrePersist
     protected void onCreate() {
@@ -79,6 +81,21 @@ public class Bill {
     public Long getSubEventId() { return subEventId; }
     public void setSubEventId(Long subEventId) { this.subEventId = subEventId; }
 
+    public String getRejectionReason() { return rejectionReason; }
+    public void setRejectionReason(String rejectionReason) { this.rejectionReason = rejectionReason; }
+
+    public String getRejectedBy() { return rejectedBy; }
+    public void setRejectedBy(String rejectedBy) { this.rejectedBy = rejectedBy; }
+
+    public Long getUploadedById() { return uploadedById; }
+    public void setUploadedById(Long uploadedById) { this.uploadedById = uploadedById; }
+
+    public String getUploadedByName() { return uploadedByName; }
+    public void setUploadedByName(String uploadedByName) { this.uploadedByName = uploadedByName; }
+
+    public String getUploadedByRole() { return uploadedByRole; }
+    public void setUploadedByRole(String uploadedByRole) { this.uploadedByRole = uploadedByRole; }
+
     public String getDescription() { return description; }
     public void setDescription(String description) { this.description = description; }
 
@@ -90,4 +107,7 @@ public class Bill {
 
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
+
+    public String getReceiptImage() { return receiptImage; }
+    public void setReceiptImage(String receiptImage) { this.receiptImage = receiptImage; }
 }

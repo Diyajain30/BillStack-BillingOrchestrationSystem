@@ -1,537 +1,631 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { jsPDF } from 'jspdf';
-
-import axios from 'axios';
 import { backendApi } from '../services/api';
+import AuditLogModal from './AuditLogModal';
+import ReceiptPreviewPane from './ReceiptPreviewPane';
+import MasterEventExplorer from './MasterEventExplorer';
 
-export default function AccountsDashboard({ user }) {
+export default function AccountsDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  const [masterEvent, setMasterEvent] = useState(null);
-  const [subEvents, setSubEvents] = useState([]);
+  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Settlements' | 'Profile'
   const [bills, setBills] = useState([]);
+  const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(false);
-
-  // Folder View & Action State
-  const [selectedFolder, setSelectedFolder] = useState(null);
   const [actionLoading, setActionLoading] = useState(false);
-  const [accountRemark, setAccountRemark] = useState('');
+  const [feedback, setFeedback] = useState({ type: '', text: '' });
 
-  useEffect(() => {
-    fetchData();
-  }, []);
+  // Read-only bill inspection & audit logs
+  const [selectedBill, setSelectedBill] = useState(null);
+  const [selectedBillForAudit, setSelectedBillForAudit] = useState(null);
+
+  const showMessage = (type, text) => {
+    setFeedback({ type, text });
+    setTimeout(() => {
+      setFeedback((prev) => (prev.text === text ? { type: '', text: '' } : prev));
+    }, 5000);
+  };
 
   const fetchData = async () => {
     setLoading(true);
     try {
       const [billsRes, eventsRes] = await Promise.all([
-        backendApi.get('/bills').catch(() => axios.get('http://localhost:8080/api/bills').catch(() => ({ data: [] }))),
-        backendApi.get('/events').catch(() => axios.get('http://localhost:8080/api/events').catch(() => ({ data: [] }))),
+        backendApi.get('/bills').catch(() => ({ data: [] })),
+        backendApi
+          .get('/events')
+          .catch(() => backendApi.get('/subevents').catch(() => ({ data: [] }))),
       ]);
-
-      const allEvents = Array.isArray(eventsRes.data) ? eventsRes.data : [];
-      const foundMaster = allEvents.find((ev) => ev.parentEventId === null || ev.parentEventId === undefined);
-      const foundSubs = allEvents.filter((ev) => ev.parentEventId !== null && ev.parentEventId !== undefined);
-
-      setMasterEvent(foundMaster || null);
-      setSubEvents(foundSubs.length > 0 ? foundSubs : allEvents);
       setBills(Array.isArray(billsRes.data) ? billsRes.data : []);
+      setAllEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
     } catch (error) {
-      console.error('Failed to sync accounts data:', error);
+      console.error('Failed to sync Accounts data:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to load accounts ledger.'
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  // 1. Single Sub-Event Folder PDF Generator
-  const generateSubEventPdf = (sub) => {
-    const doc = new jsPDF();
-    const folderBills = bills.filter(
-      (b) =>
-        (b.subEventId && String(b.subEventId) === String(sub.id)) ||
-        (b.eventName && b.eventName.toLowerCase().trim() === sub.name.toLowerCase().trim())
-    );
-    const subSpent = folderBills.reduce((acc, b) => acc + (Number(b.amount) || 0), 0);
+  useEffect(() => {
+    fetchData();
+  }, []);
 
-    doc.setFillColor(30, 41, 59);
-    doc.rect(0, 0, 210, 35, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(16);
-    doc.setFont('helvetica', 'bold');
-    doc.text('ACCOUNTS SECTION - SUB-EVENT FINANCIAL FOLDER', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Sub-Event: ${sub.name} (${sub.department}) | ID: #${sub.id}`, 14, 27);
-
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(12);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Folder Allocation & Expenditure Summary', 14, 45);
-
-    doc.autoTable({
-      startY: 50,
-      head: [['Department Scope', 'Allocated Budget Cap', 'Total Outflow Spent', 'Net Balance']],
-      body: [
-        [
-          sub.department,
-          `Rs. ${sub.budgetCap?.toLocaleString('en-IN')}`,
-          `Rs. ${subSpent.toLocaleString('en-IN')}`,
-          `Rs. ${(sub.budgetCap - subSpent).toLocaleString('en-IN')}`
-        ]
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [51, 65, 85] }
-    });
-
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Itemized Bills & Vouchers Ledger', 14, currentY);
-
-    const bRows = folderBills.map((b) => [
-      `#${b.billNo || b.id}`,
-      b.vendorName || 'N/A',
-      b.billDate || 'N/A',
-      `Rs. ${Number(b.amount).toFixed(2)}`,
-      b.status
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Invoice No', 'Vendor Name', 'Bill Date', 'Amount', 'Audit Status']],
-      body: bRows,
-      theme: 'grid',
-      headStyles: { fillColor: [51, 65, 85] }
-    });
-
-    doc.save(`Accounts_Folder_${sub.name.replace(/\s+/g, '_')}.pdf`);
+  const handleSignOut = () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    if (typeof onLogout === 'function') onLogout();
+    navigate('/', { replace: true });
   };
 
-  // 2. Complete Master Event Portfolio PDF Generator (All Sub-Event Folders & Bills)
-  const generateMasterEventPdf = () => {
-    const doc = new jsPDF();
-    const festName = masterEvent ? (masterEvent.name || masterEvent.wingName) : 'WINGS Fest Master Portfolio';
+  const masterEvents = allEvents.filter(
+    (ev) => ev.parentEventId === null || ev.parentEventId === undefined
+  );
+  const subEvents = allEvents.filter(
+    (ev) => ev.parentEventId !== null && ev.parentEventId !== undefined
+  );
 
-    doc.setFillColor(15, 23, 42); // Dark Slate
-    doc.rect(0, 0, 210, 35, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(18);
-    doc.setFont('helvetica', 'bold');
-    doc.text('ACCOUNTS DISBURSEMENT MASTER LEDGER', 14, 18);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(`Master Event: ${festName} | Date: ${new Date().toLocaleDateString()}`, 14, 27);
+  const getApprovedSpentForSubEvent = (se) =>
+    bills
+      .filter(
+        (b) =>
+          b.status === 'APPROVED' &&
+          ((b.subEventId !== null &&
+            b.subEventId !== undefined &&
+            String(b.subEventId) === String(se.id)) ||
+            (b.eventName &&
+              se.name &&
+              b.eventName.toLowerCase().trim() === se.name.toLowerCase().trim()))
+      )
+      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
 
-    // Master Overview
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(12);
-    doc.setFont('helvetica', 'bold');
-    doc.text('1. Master Event Allocation', 14, 45);
+  const handleDisburseSubEvent = async (subEvent) => {
+    const approvedSpent = getApprovedSpentForSubEvent(subEvent);
+    const advance = Number(subEvent.advanceDisbursed) || 0;
+    const netSettlement = approvedSpent - advance;
+    const label =
+      netSettlement >= 0
+        ? `Reimburse INR ${netSettlement.toLocaleString('en-IN')}`
+        : `Recover INR ${Math.abs(netSettlement).toLocaleString('en-IN')}`;
 
-    const totalBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-    const totalSpent = bills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+    if (
+      !window.confirm(
+        `Authorize final disbursement for "${subEvent.name}"?\nApproved Spend: INR ${approvedSpent.toLocaleString('en-IN')}\nAdvance Disbursed: INR ${advance.toLocaleString('en-IN')}\nNet Settlement: ${label}`
+      )
+    ) {
+      return;
+    }
 
-    doc.autoTable({
-      startY: 50,
-      head: [['Master Title', 'Sanctioned Fest Budget', 'Total Audited Outflow', 'Lifecycle Status']],
-      body: [[festName, `Rs. ${totalBudget?.toLocaleString('en-IN')}`, `Rs. ${totalSpent.toLocaleString('en-IN')}`, masterEvent?.status || 'ACTIVE']],
-      theme: 'striped',
-      headStyles: { fillColor: [15, 23, 42] }
-    });
-
-    // Sub-Events Breakdown
-    let currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('2. Nested Sub-Event Folders', 14, currentY);
-
-    const subRows = subEvents.map((s) => [
-      `#${s.id}`,
-      s.name,
-      s.department,
-      `Rs. ${s.budgetCap?.toLocaleString('en-IN')}`,
-      `Rs. ${s.totalSpent?.toLocaleString('en-IN') || 0}`
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Folder ID', 'Sub-Event Name', 'Department', 'Budget Cap', 'Spent Total']],
-      body: subRows,
-      theme: 'grid',
-      headStyles: { fillColor: [30, 41, 59] }
-    });
-
-    // All Bills Ledger
-    currentY = doc.lastAutoTable.finalY + 15;
-    doc.text('3. Master Bills & Vouchers Audit Register', 14, currentY);
-
-    const billRows = bills.map((b) => [
-      `#${b.billNo || b.id}`,
-      b.vendorName || 'N/A',
-      b.eventName || 'General',
-      `Rs. ${Number(b.amount).toFixed(2)}`,
-      b.status
-    ]);
-
-    doc.autoTable({
-      startY: currentY + 5,
-      head: [['Invoice No', 'Vendor Name', 'Sub-Event', 'Amount', 'Status']],
-      body: billRows,
-      theme: 'striped',
-      headStyles: { fillColor: [30, 41, 59] }
-    });
-
-    doc.save(`${festName.replace(/\s+/g, '_')}_Complete_Accounts_Ledger.pdf`);
-  };
-
-  // 3. Approve or Reject Sub-Event Folder Status
-  const handleUpdateFolderStatus = async (subEventId, newStatus) => {
     setActionLoading(true);
     try {
-      await backendApi.put(`/events/${subEventId}`, {
-        status: newStatus,
-        description: accountRemark ? `Accounts note: ${accountRemark}` : undefined
-      }).catch(() => 
-        axios.put(`http://localhost:8080/api/events/${subEventId}`, {
-          status: newStatus,
-          description: accountRemark ? `Accounts note: ${accountRemark}` : undefined
-        })
+      await backendApi.post(`/subevents/${subEvent.id}/disburse`);
+      showMessage(
+        'success',
+        `Disbursement authorized for "${subEvent.name}" (${label}).`
       );
-
-      alert(`Sub-Event Folder status updated to "${newStatus}"!`);
-      setSelectedFolder(null);
-      setAccountRemark('');
-      fetchData();
-    } catch (err) {
-      console.error('Failed to update folder status:', err);
-      alert('Failed to update folder status.');
+      await fetchData();
+    } catch (error) {
+      console.error('Disbursement failed:', error);
+      showMessage(
+        'error',
+        error.response?.data?.message || 'Failed to authorize disbursement.'
+      );
     } finally {
       setActionLoading(false);
     }
   };
 
-  // Metric Computations
-  const totalFestBudget = masterEvent ? masterEvent.budgetCap : subEvents.reduce((acc, s) => acc + (Number(s.budgetCap) || 0), 0);
-  const totalAuditedSpent = bills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+  const generateSubEventPdf = (subEvent, approvedSpent) => {
+    const doc = new jsPDF();
+    const advance = Number(subEvent.advanceDisbursed) || 0;
+    const cap = Number(subEvent.budgetCap) || 0;
+    const netSettlement = approvedSpent - advance;
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text('ACCOUNTS SECTION — SUB-EVENT SETTLEMENT STATEMENT', 105, 20, {
+      align: 'center',
+    });
+    doc.line(15, 26, 195, 26);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Sub-Event: ${subEvent.name}`, 16, 36);
+    doc.text(`Department: ${subEvent.department || 'Institutional'}`, 16, 44);
+    doc.text(`Status: ${subEvent.status || 'OPEN'}`, 130, 36);
+    doc.text(`Generated: ${new Date().toLocaleDateString()}`, 130, 44);
+
+    doc.rect(15, 52, 180, 44);
+    doc.text(`Sanctioned Budget Cap: INR ${cap.toLocaleString('en-IN')}`, 20, 62);
+    doc.text(`Approved Expenditure: INR ${approvedSpent.toLocaleString('en-IN')}`, 20, 72);
+    doc.text(`Advance Disbursed: INR ${advance.toLocaleString('en-IN')}`, 20, 82);
+    doc.setFont('helvetica', 'bold');
+    doc.text(
+      `Net Settlement (${netSettlement >= 0 ? 'Payable' : 'Refundable'}): INR ${Math.abs(netSettlement).toLocaleString('en-IN')}`,
+      20,
+      92
+    );
+
+    doc.save(`Accounts_Settlement_${(subEvent.name || 'SubEvent').replace(/\s+/g, '_')}.pdf`);
+  };
+
+  const generateVoucherPdf = (bill) => {
+    const doc = new jsPDF();
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text('ACCOUNTS AUDIT VOUCHER', 105, 20, { align: 'center' });
+    doc.line(15, 26, 195, 26);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Invoice No: ${bill.billNo || bill.id}`, 16, 36);
+    doc.text(`Date: ${bill.billDate || 'N/A'}`, 130, 36);
+    doc.text(`Vendor: ${bill.vendorName || 'N/A'}`, 16, 44);
+    doc.text(`GSTIN: ${bill.vendorGstin || 'Unregistered'}`, 130, 44);
+    doc.text(`Sub-Event: ${bill.eventName || 'N/A'}`, 16, 52);
+    doc.text(`Status: ${bill.status}`, 130, 52);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Grand Total: INR ${Number(bill.amount || 0).toFixed(2)}`, 16, 64);
+
+    doc.save(`Accounts_Voucher_${bill.billNo || bill.id}.pdf`);
+  };
+
+  const generateMasterLedgerPdf = () => {
+    const doc = new jsPDF();
+    const totalBudget = (masterEvents.length > 0 ? masterEvents : subEvents).reduce(
+      (acc, ev) => acc + (Number(ev.budgetCap) || 0),
+      0
+    );
+    const totalApproved = bills
+      .filter((b) => b.status === 'APPROVED')
+      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+    const totalAdvance = subEvents.reduce(
+      (sum, s) => sum + (Number(s.advanceDisbursed) || 0),
+      0
+    );
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text('ACCOUNTS MASTER DISBURSEMENT LEDGER', 14, 20);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Generated: ${new Date().toLocaleDateString()}`, 14, 28);
+    doc.text(`Total Master Budget: INR ${totalBudget.toLocaleString('en-IN')}`, 14, 40);
+    doc.text(`Total Approved Expenditure: INR ${totalApproved.toLocaleString('en-IN')}`, 14, 48);
+    doc.text(`Total Cash Advances: INR ${totalAdvance.toLocaleString('en-IN')}`, 14, 56);
+    doc.text(
+      `Net Settlement Position: INR ${(totalApproved - totalAdvance).toLocaleString('en-IN')}`,
+      14,
+      64
+    );
+
+    doc.save('BillStack_Accounts_Master_Ledger.pdf');
+  };
+
+  // Approved-only top KPIs
+  const totalBudget = (masterEvents.length > 0 ? masterEvents : subEvents).reduce(
+    (acc, ev) => acc + (Number(ev.budgetCap) || 0),
+    0
+  );
+  const totalAdvance = subEvents.reduce(
+    (acc, s) => acc + (Number(s.advanceDisbursed) || 0),
+    0
+  );
+  const totalApprovedSpend = bills
+    .filter((b) => b.status === 'APPROVED')
+    .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+  const netSettlementTotal = totalApprovedSpend - totalAdvance;
+
+  const navItems = [
+    { id: 'Folders', label: 'Master Events', count: masterEvents.length },
+    { id: 'Settlements', label: 'Settlement Tracker', count: subEvents.length },
+    { id: 'Profile', label: 'Profile' },
+  ];
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex font-sans">
-      
-      {/* Sidebar */}
-      <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between p-6 shrink-0">
-        <div className="space-y-6">
+    <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
+      <header className="bg-white border-b border-sage-200 sticky top-0 z-30">
+        <div className="px-6 py-3.5 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-emerald-600 flex items-center justify-center text-xl font-black text-white shadow-lg">
-              ₹
-            </div>
-            <div>
-              <span className="text-xl font-black tracking-wider text-emerald-400">BillStack</span>
-              <span className="block bg-emerald-950 border border-emerald-800 text-emerald-300 text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider w-fit mt-0.5">
-                Accounts Portal
-              </span>
+            <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-sage-900">BillStack</span>
+              <span className="text-stone-300">/</span>
+              <h1 className="text-sm font-medium text-stone-700">Accounts Section Portal</h1>
             </div>
           </div>
 
-          <nav className="space-y-1.5 pt-4">
-            <div className="px-4 py-3 bg-emerald-950/60 border border-emerald-800/80 rounded-xl text-xs font-bold text-white flex items-center justify-between">
-              <span className="flex items-center gap-2">
-                <span>📁</span> Event Folders
-              </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-emerald-300 font-extrabold">
-                {subEvents.length}
-              </span>
-            </div>
-          </nav>
-        </div>
-
-        <div className="pt-6 border-t border-slate-800">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-8 h-8 rounded-full bg-emerald-700 flex items-center justify-center text-sm font-bold text-white">
-              {user?.name ? user.name[0].toUpperCase() : 'A'}
-            </div>
-            <div className="overflow-hidden">
-              <p className="text-xs font-bold truncate text-slate-200">{user?.name || 'Accounts Officer'}</p>
-              <p className="text-[10px] text-slate-400 truncate">FINANCE & ACCOUNTS</p>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              localStorage.clear();
-              navigate('/');
-            }}
-            className="w-full py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-xs font-bold text-slate-300 transition"
-          >
-            Sign Out
-          </button>
-        </div>
-      </aside>
-
-      {/* Main Workspace */}
-      <main className="flex-1 p-8 overflow-y-auto max-w-6xl space-y-6">
-        
-        {/* Header Banner */}
-        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-slate-800">
-          <div>
-            <h1 className="text-2xl font-black text-white tracking-tight">Accounts Section Financial Portal</h1>
-            <p className="text-xs text-slate-400 mt-1">
-              Inspect event folders, review itemized bills, download folder PDFs, and grant final financial settlement authorization.
-            </p>
-          </div>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-medium text-stone-800 hidden sm:inline">
+              {user?.name || user?.username || 'Accounts'}
+            </span>
             <button
-              onClick={generateMasterEventPdf}
-              className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl text-xs font-bold text-white shadow-md transition flex items-center gap-2"
+              onClick={generateMasterLedgerPdf}
+              className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-lg text-xs font-medium transition cursor-pointer"
             >
-              🖨️ Download Master Event Ledger (PDF)
+              Export Ledger
             </button>
             <button
               onClick={fetchData}
-              className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-bold text-slate-200 shadow-sm transition"
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
             >
-              ↻ Sync
+              Sync
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 rounded-lg text-xs font-medium text-stone-700 transition cursor-pointer"
+            >
+              Sign Out
             </button>
           </div>
-        </header>
+        </div>
+      </header>
 
-        {/* Metric Cards */}
-        <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Sanctioned Fest Allocation</span>
-            <h2 className="text-3xl font-black text-white mt-1">₹{totalFestBudget.toLocaleString('en-IN')}</h2>
-            <p className="text-xs text-slate-400 mt-1">{subEvents.length} Department Sub-Events</p>
-          </div>
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 bg-white border-r border-sage-200 p-4 shrink-0 hidden md:block">
+          <nav className="space-y-1.5">
+            {navItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
+                  activeTab === item.id
+                    ? 'bg-sage-100 text-sage-900 border border-sage-200'
+                    : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
+                }`}
+              >
+                <span>{item.label}</span>
+                {item.count !== undefined && (
+                  <span className="text-xs px-2 py-0.5 rounded-md bg-white text-stone-600 border border-sage-200">
+                    {item.count}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </aside>
 
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Audited Expenditure</span>
-            <h2 className="text-3xl font-black text-emerald-400 mt-1">₹{totalAuditedSpent.toLocaleString('en-IN')}</h2>
-            <p className="text-xs text-slate-400 mt-1">Drawn across all event vouchers</p>
-          </div>
-
-          <div className="bg-slate-800/60 p-5 rounded-2xl border border-slate-700/80 shadow-sm">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Master Event Title</span>
-            <h2 className="text-xl font-black text-violet-400 mt-1 truncate">
-              {masterEvent ? (masterEvent.name || masterEvent.wingName) : 'WINGS 2026'}
-            </h2>
-            <p className="text-xs text-slate-400 mt-1">Lifecycle: {masterEvent?.status || 'ACTIVE'}</p>
-          </div>
-        </section>
-
-        {/* Sub-Event Folders Section */}
-        <section className="space-y-4">
-          <div className="flex justify-between items-center">
-            <h2 className="text-lg font-black text-white flex items-center gap-2">
-              <span>📁</span> Department Sub-Event Folders ({subEvents.length})
-            </h2>
-            <span className="text-xs text-slate-400">Click any folder card to view bills and sanction approval/rejection</span>
-          </div>
-
-          {loading ? (
-            <div className="p-12 text-center text-xs font-bold text-slate-400">Syncing event folders...</div>
-          ) : subEvents.length === 0 ? (
-            <div className="p-12 text-center bg-slate-800/40 border border-slate-800 rounded-2xl text-slate-400 text-xs">
-              No active sub-event folders available.
+        <main className="flex-1 p-6 md:p-8 overflow-y-auto">
+          <div className="max-w-6xl mx-auto space-y-6">
+            {/* Mobile Nav */}
+            <div className="flex gap-2 overflow-x-auto pb-1 md:hidden">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-medium shrink-0 transition cursor-pointer ${
+                    activeTab === item.id
+                      ? 'bg-sage-600 text-white'
+                      : 'bg-white border border-sage-200 text-stone-600'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
             </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {subEvents.map((evt) => {
-                const folderBills = bills.filter(
-                  (b) =>
-                    (b.subEventId && String(b.subEventId) === String(evt.id)) ||
-                    (b.eventName && b.eventName.toLowerCase().trim() === evt.name.toLowerCase().trim())
-                );
-                const subSpent = folderBills.reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
 
-                return (
-                  <div
-                    key={evt.id}
-                    className="bg-slate-800/60 border border-slate-700/80 hover:border-emerald-500 rounded-2xl p-5 space-y-4 transition shadow-sm hover:shadow-md flex flex-col justify-between"
-                  >
-                    <div onClick={() => setSelectedFolder(evt)} className="cursor-pointer space-y-2">
-                      <div className="flex justify-between items-center">
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800">
-                          {evt.department}
-                        </span>
-                        <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
-                          evt.status === 'APPROVED' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' :
-                          evt.status === 'REJECTED' ? 'bg-rose-950 text-rose-300 border border-rose-800' :
-                          'bg-amber-950 text-amber-300 border border-amber-800'
-                        }`}>
-                          {evt.status || 'OPEN'}
-                        </span>
-                      </div>
-                      <h3 className="text-base font-bold text-white flex items-center gap-2">
-                        <span>📁</span> {evt.name}
-                      </h3>
-                      <p className="text-[11px] font-mono text-slate-400">Sub-Event ID: #{evt.id}</p>
-                    </div>
+            {feedback.text && (
+              <div
+                className={`px-4 py-3 rounded-lg border text-xs font-medium ${
+                  feedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : 'bg-sage-100 border-sage-200 text-sage-900'
+                }`}
+              >
+                {feedback.text}
+              </div>
+            )}
 
-                    <div onClick={() => setSelectedFolder(evt)} className="bg-slate-900/60 p-3 rounded-xl border border-slate-800/80 space-y-1.5 text-xs cursor-pointer">
-                      <div className="flex justify-between text-slate-400">
-                        <span>Sanctioned Cap:</span>
-                        <span className="font-bold text-slate-200">₹{evt.budgetCap?.toLocaleString('en-IN')}</span>
-                      </div>
-                      <div className="flex justify-between text-slate-400">
-                        <span>Total Spent:</span>
-                        <span className="font-bold text-emerald-400">₹{subSpent.toLocaleString('en-IN')}</span>
-                      </div>
-                      <div className="flex justify-between text-slate-400 pt-1 border-t border-slate-800">
-                        <span>Vouchers Uploaded:</span>
-                        <span className="font-bold text-violet-400">{folderBills.length}</span>
-                      </div>
-                    </div>
+            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">Total Master Budget</p>
+                <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                  INR {totalBudget.toLocaleString('en-IN')}
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">Approved Expenditure</p>
+                <p className="text-2xl font-semibold text-sage-800 mt-1.5">
+                  INR {totalApprovedSpend.toLocaleString('en-IN')}
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">Advances Disbursed</p>
+                <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                  INR {totalAdvance.toLocaleString('en-IN')}
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
+                <p className="text-xs font-medium text-stone-500">
+                  Net Settlement ({netSettlementTotal >= 0 ? 'Payable' : 'Refundable'})
+                </p>
+                <p className="text-2xl font-semibold text-stone-900 mt-1.5">
+                  INR {Math.abs(netSettlementTotal).toLocaleString('en-IN')}
+                </p>
+              </div>
+            </section>
 
-                    <div className="pt-2 border-t border-slate-700/60 flex justify-between items-center text-xs">
+            {/* MASTER EVENTS DRILL-DOWN TAB */}
+            {activeTab === 'Folders' &&
+              (loading ? (
+                <div className="bg-white p-10 rounded-xl border border-sage-200 text-center text-xs text-stone-500">
+                  Loading master event files...
+                </div>
+              ) : (
+                <MasterEventExplorer
+                  allEvents={allEvents}
+                  bills={bills}
+                  onReviewBill={(b) => setSelectedBill(b)}
+                  onDownloadPdf={(b) => generateVoucherPdf(b)}
+                  onAuditLogs={(billId) => setSelectedBillForAudit(billId)}
+                  reviewButtonLabel={() => 'View Bill'}
+                  renderSubEventActions={(subEvent, approvedSpent) => (
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
-                        onClick={() => generateSubEventPdf(evt)}
-                        className="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-[10px] font-bold transition shadow-sm"
+                        type="button"
+                        onClick={() => generateSubEventPdf(subEvent, approvedSpent)}
+                        className="px-3 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-lg text-xs font-medium cursor-pointer"
                       >
-                        🖨️ Folder PDF
+                        Export Statement PDF
                       </button>
-                      <span onClick={() => setSelectedFolder(evt)} className="text-emerald-400 font-bold hover:underline cursor-pointer">
-                        Inspect & Review →
-                      </span>
+                      {subEvent.status !== 'DISBURSED' && (
+                        <button
+                          type="button"
+                          disabled={actionLoading}
+                          onClick={() => handleDisburseSubEvent(subEvent)}
+                          className="px-3.5 py-1.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-lg text-xs font-medium cursor-pointer"
+                        >
+                          Authorize Disbursement
+                        </button>
+                      )}
                     </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
+                  )}
+                />
+              ))}
 
-        {/* FOLDER INSPECTION & APPROVAL/REJECTION MODAL */}
-        {selectedFolder && (
-          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-900 border border-slate-700 w-full max-w-4xl rounded-2xl shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto text-slate-100">
-              
-              {/* Modal Header */}
-              <div className="flex justify-between items-start border-b border-slate-800 pb-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-2xl">📁</span>
-                    <h3 className="text-xl font-black text-white">{selectedFolder.name}</h3>
-                    <span className="text-xs font-bold px-2.5 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded-md">
-                      {selectedFolder.department}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-400 mt-1">
-                    Current Audit Status: <strong className="text-emerald-400">{selectedFolder.status || 'OPEN'}</strong>
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => generateSubEventPdf(selectedFolder)}
-                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow"
-                  >
-                    🖨️ Print Folder PDF
-                  </button>
-                  <button onClick={() => setSelectedFolder(null)} className="text-slate-400 hover:text-white text-2xl font-bold">✕</button>
-                </div>
-              </div>
+            {/* SETTLEMENT TRACKER TAB */}
+            {activeTab === 'Settlements' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Sub-Event Disbursement &amp; Settlement Tracker ({subEvents.length})
+                </h2>
 
-              {/* Folder Spending Position */}
-              <div className="grid grid-cols-3 gap-3 text-xs">
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Sanctioned Budget</span>
-                  <span className="text-base font-black text-white">₹{selectedFolder.budgetCap?.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Total Outflow Spent</span>
-                  <span className="text-base font-black text-emerald-400">
-                    ₹{bills
-                      .filter(b => (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) || (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim()))
-                      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0)
-                      .toLocaleString('en-IN')}
-                  </span>
-                </div>
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800">
-                  <span className="text-slate-400 uppercase text-[10px] font-bold block">Net Balance</span>
-                  <span className="text-base font-black text-violet-400">
-                    ₹{(selectedFolder.budgetCap - bills
-                      .filter(b => (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) || (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim()))
-                      .reduce((sum, b) => sum + (Number(b.amount) || 0), 0)).toLocaleString('en-IN')}
-                  </span>
-                </div>
-              </div>
-
-              {/* Bills Table inside Folder */}
-              <div className="space-y-3">
-                <h4 className="text-sm font-bold text-white flex items-center gap-2">
-                  <span>📑</span> Invoices & Vouchers in this Folder
-                </h4>
-
-                {bills.filter(b => (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) || (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim())).length === 0 ? (
-                  <div className="p-8 text-center text-slate-500 bg-slate-950/40 rounded-xl border border-dashed border-slate-800 text-xs">
-                    No bills uploaded to this folder yet.
+                {subEvents.length === 0 ? (
+                  <div className="py-10 text-center text-xs text-stone-500 bg-sage-50/50 border border-sage-200/80 rounded-lg">
+                    No sub-events recorded yet.
                   </div>
                 ) : (
-                  <div className="overflow-x-auto border border-slate-800 rounded-xl">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-slate-950 text-slate-400 font-bold border-b border-slate-800">
+                  <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                    <table className="w-full text-left text-sm border-collapse">
+                      <thead className="bg-sage-50 text-stone-600 text-xs font-medium border-b border-sage-200">
                         <tr>
-                          <th className="py-2.5 px-3">Invoice No</th>
-                          <th className="py-2.5 px-3">Vendor</th>
-                          <th className="py-2.5 px-3">Amount</th>
-                          <th className="py-2.5 px-3">Date</th>
-                          <th className="py-2.5 px-3">Status</th>
+                          <th className="py-3 px-4">Sub-Event</th>
+                          <th className="py-3 px-4">Budget Cap</th>
+                          <th className="py-3 px-4">Approved Spend</th>
+                          <th className="py-3 px-4">Advance</th>
+                          <th className="py-3 px-4">Net Settlement</th>
+                          <th className="py-3 px-4">Status</th>
+                          <th className="py-3 px-4 text-center">Action</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-slate-800 text-slate-300">
-                        {bills
-                          .filter(b => (b.subEventId && String(b.subEventId) === String(selectedFolder.id)) || (b.eventName && b.eventName.toLowerCase().trim() === selectedFolder.name.toLowerCase().trim()))
-                          .map((b) => (
-                            <tr key={b.id} className="hover:bg-slate-800/40">
-                              <td className="py-2.5 px-3 font-mono text-emerald-300 font-bold">#{b.billNo || b.id}</td>
-                              <td className="py-2.5 px-3 font-semibold text-white">{b.vendorName}</td>
-                              <td className="py-2.5 px-3 font-black text-white">₹{Number(b.amount).toFixed(2)}</td>
-                              <td className="py-2.5 px-3 text-slate-400">{b.billDate || 'N/A'}</td>
-                              <td className="py-2.5 px-3">
-                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300">
-                                  {b.status}
+                      <tbody className="divide-y divide-sage-100 text-stone-800">
+                        {subEvents.map((se) => {
+                          const approvedSpent = getApprovedSpentForSubEvent(se);
+                          const advance = Number(se.advanceDisbursed) || 0;
+                          const net = approvedSpent - advance;
+
+                          return (
+                            <tr key={se.id} className="hover:bg-sage-50/40">
+                              <td className="py-3 px-4">
+                                <span className="font-medium text-stone-900 block">
+                                  {se.name}
+                                </span>
+                                <span className="text-xs text-stone-500">
+                                  {se.department || 'Institutional'}
                                 </span>
                               </td>
+                              <td className="py-3 px-4 text-xs">
+                                INR {Number(se.budgetCap || 0).toLocaleString('en-IN')}
+                              </td>
+                              <td className="py-3 px-4 text-xs font-medium text-sage-800">
+                                INR {approvedSpent.toLocaleString('en-IN')}
+                              </td>
+                              <td className="py-3 px-4 text-xs">
+                                INR {advance.toLocaleString('en-IN')}
+                              </td>
+                              <td className="py-3 px-4 text-xs font-semibold">
+                                {net >= 0 ? 'Pay ' : 'Recover '}INR{' '}
+                                {Math.abs(net).toLocaleString('en-IN')}
+                              </td>
+                              <td className="py-3 px-4">
+                                <span className="px-2 py-0.5 rounded-md border text-[11px] font-medium bg-sage-50 border-sage-200 text-sage-800">
+                                  {se.status || 'OPEN'}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 text-center">
+                                <div className="inline-flex items-center gap-2">
+                                  <button
+                                    onClick={() => generateSubEventPdf(se, approvedSpent)}
+                                    className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                  >
+                                    PDF
+                                  </button>
+                                  {se.status !== 'DISBURSED' && (
+                                    <button
+                                      onClick={() => handleDisburseSubEvent(se)}
+                                      disabled={actionLoading}
+                                      className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium cursor-pointer"
+                                    >
+                                      Disburse
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
                             </tr>
-                          ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
                 )}
+              </section>
+            )}
+
+            {/* PROFILE TAB */}
+            {activeTab === 'Profile' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] max-w-lg space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Profile
+                </h2>
+                <div className="space-y-3 text-sm">
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Full Name</span>
+                    <span className="font-medium text-stone-900">
+                      {user?.name || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Username</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.username || 'N/A'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Role</span>
+                    <span className="font-medium text-sage-800">
+                      {user?.role || 'ACCOUNTS'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2 border-b border-sage-100">
+                    <span className="text-stone-500">Department</span>
+                    <span className="text-stone-800">
+                      {user?.department || 'Institutional'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-2">
+                    <span className="text-stone-500">Staff ID</span>
+                    <span className="font-mono text-stone-800">
+                      {user?.institutionalId || 'N/A'}
+                    </span>
+                  </div>
+                </div>
+              </section>
+            )}
+          </div>
+        </main>
+      </div>
+
+      {/* SIDE-BY-SIDE READ-ONLY BILL VIEWER MODAL */}
+      {selectedBill && (
+        <div className="fixed inset-0 bg-stone-900/45 backdrop-blur-[1px] flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-sage-200 w-full max-w-5xl rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.08)] max-h-[92vh] overflow-hidden flex flex-col">
+            <div className="px-6 py-4 border-b border-sage-100 bg-sage-50/60 flex justify-between items-center">
+              <div>
+                <h3 className="text-base font-semibold text-stone-900">
+                  Bill Audit Details (Read-Only)
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Scanned invoice side-by-side with verified particulars.
+                </p>
+              </div>
+              <button
+                onClick={() => setSelectedBill(null)}
+                className="text-xs font-medium text-stone-500 hover:text-stone-800 cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-6">
+                <ReceiptPreviewPane
+                  receiptImage={selectedBill.receiptImage}
+                  billNo={selectedBill.billNo || selectedBill.id}
+                />
               </div>
 
-              {/* Accounts Action & Remark Section at the bottom of the folder */}
-              <div className="pt-4 border-t border-slate-800 space-y-3 bg-slate-950/60 p-4 rounded-xl border">
-                <h4 className="text-xs font-black uppercase text-emerald-400">Accounts Final Settlement Authorization</h4>
-                
-                <div>
-                  <label className="block text-xs font-bold text-slate-400 mb-1">Accounts Audit Remark / Note:</label>
-                  <textarea
-                    rows={2}
-                    value={accountRemark}
-                    onChange={(e) => setAccountRemark(e.target.value)}
-                    placeholder="e.g., Verified against original vouchers; cleared for final bank disbursement."
-                    className="w-full p-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white outline-none focus:border-emerald-500"
-                  />
+              <div className="lg:col-span-6 space-y-4">
+                <div className="bg-sage-50/60 border border-sage-200 rounded-xl p-4 grid grid-cols-2 gap-3 text-xs">
+                  <div>
+                    <span className="text-stone-500 block">Vendor Name</span>
+                    <span className="font-semibold text-stone-900">
+                      {selectedBill.vendorName || 'N/A'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Invoice Number</span>
+                    <span className="font-mono font-medium text-stone-900">
+                      {selectedBill.billNo || selectedBill.id}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Bill Date</span>
+                    <span className="font-medium text-stone-900">
+                      {selectedBill.billDate || 'N/A'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Vendor GSTIN</span>
+                    <span className="font-mono text-stone-900">
+                      {selectedBill.vendorGstin || 'Unregistered'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">Base Amount</span>
+                    <span className="font-medium text-stone-900">
+                      INR {Number(selectedBill.baseAmount || 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-stone-500 block">CGST / SGST</span>
+                    <span className="font-medium text-stone-900">
+                      INR {Number(selectedBill.cgst || 0).toFixed(2)} / INR{' '}
+                      {Number(selectedBill.sgst || 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="col-span-2 pt-2 border-t border-sage-200 flex justify-between items-center">
+                    <span className="font-semibold text-stone-700">Grand Total</span>
+                    <span className="text-base font-bold text-sage-900">
+                      INR {Number(selectedBill.amount || 0).toLocaleString('en-IN')}
+                    </span>
+                  </div>
                 </div>
 
-                <div className="flex justify-end gap-3 pt-1">
-                  <button
-                    onClick={() => handleUpdateFolderStatus(selectedFolder.id, 'REJECTED')}
-                    disabled={actionLoading}
-                    className="px-4 py-2 bg-rose-900/60 hover:bg-rose-900 text-rose-200 border border-rose-700 rounded-xl text-xs font-bold transition"
-                  >
-                    {actionLoading ? 'Processing...' : '✕ Reject Folder Settlement'}
-                  </button>
-                  <button
-                    onClick={() => handleUpdateFolderStatus(selectedFolder.id, 'APPROVED')}
-                    disabled={actionLoading}
-                    className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-md transition"
-                  >
-                    {actionLoading ? 'Processing...' : '✓ Approve & Disburse Folder'}
-                  </button>
-                </div>
+                {selectedBill.description && (
+                  <div className="p-3 bg-white border border-sage-200 rounded-lg text-xs text-stone-600">
+                    <strong className="text-stone-800">Audit Notes:</strong>{' '}
+                    {selectedBill.description}
+                  </div>
+                )}
               </div>
+            </div>
 
+            <div className="px-6 py-4 border-t border-sage-100 bg-sage-50/50 flex justify-end gap-2.5">
+              <button
+                onClick={() => generateVoucherPdf(selectedBill)}
+                className="px-4 py-2 bg-white hover:bg-sage-50 border border-sage-200 text-sage-800 rounded-lg text-xs font-medium cursor-pointer"
+              >
+                Export Voucher PDF
+              </button>
+              <button
+                onClick={() => setSelectedBill(null)}
+                className="px-4 py-2 bg-sage-600 hover:bg-sage-700 text-white rounded-lg text-xs font-medium cursor-pointer"
+              >
+                Close
+              </button>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-      </main>
+      {selectedBillForAudit && (
+        <AuditLogModal
+          billId={selectedBillForAudit}
+          onClose={() => setSelectedBillForAudit(null)}
+        />
+      )}
     </div>
   );
 }
