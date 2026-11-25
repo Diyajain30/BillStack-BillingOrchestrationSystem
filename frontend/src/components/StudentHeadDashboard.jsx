@@ -37,9 +37,19 @@ function parseIdList(csvOrArray) {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
-  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
 
@@ -129,6 +139,7 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   const [selectedFolder, setSelectedFolder] = useState(null);
   const [folderDetail, setFolderDetail] = useState(null);
   const [loadingFolder, setLoadingFolder] = useState(false);
+  const [folderBillTab, setFolderBillTab] = useState('all'); // 'all' | 'pending' | 'rejected' | 'approved'
 
   // Bill inspector & audit modal state
   const [selectedBill, setSelectedBill] = useState(null);
@@ -214,14 +225,42 @@ export default function StudentHeadDashboard({ user, onLogout }) {
       .sort((a, b) => (Number(b.eventYear) || 0) - (Number(a.eventYear) || 0));
   }, [events, currentUserId]);
 
+  const masterStatusById = useMemo(() => {
+    const map = new Map();
+    assignedMasterEvents.forEach((m) => {
+      map.set(Number(m.id), String(m.status || '').toUpperCase());
+    });
+    return map;
+  }, [assignedMasterEvents]);
+
+  const isSubEventClosed = useCallback(
+    (se) => {
+      if (!se) return false;
+      if (String(se.status || '').toUpperCase() === 'CLOSED') return true;
+      if (se.parentEventId != null) {
+        return masterStatusById.get(Number(se.parentEventId)) === 'CLOSED';
+      }
+      return false;
+    },
+    [masterStatusById]
+  );
+
+  const openMasterEvents = useMemo(
+    () =>
+      assignedMasterEvents.filter(
+        (m) => String(m.status || '').toUpperCase() !== 'CLOSED'
+      ),
+    [assignedMasterEvents]
+  );
+
   useEffect(() => {
-    if (assignedMasterEvents.length > 0 && !newSubEvent.parentEventId) {
+    if (openMasterEvents.length > 0 && !newSubEvent.parentEventId) {
       setNewSubEvent((prev) => ({
         ...prev,
-        parentEventId: String(assignedMasterEvents[0].id),
+        parentEventId: String(openMasterEvents[0].id),
       }));
     }
-  }, [assignedMasterEvents, newSubEvent.parentEventId]);
+  }, [openMasterEvents, newSubEvent.parentEventId]);
 
   const fetchAvailableLeads = useCallback(
     async (parentEventId, excludeSubEventId = null) => {
@@ -264,14 +303,19 @@ export default function StudentHeadDashboard({ user, onLogout }) {
     );
   }, [events, assignedMasterIds]);
 
+  const openSubEvents = useMemo(
+    () => scopedSubEvents.filter((se) => !isSubEventClosed(se)),
+    [scopedSubEvents, isSubEventClosed]
+  );
+
   useEffect(() => {
-    if (scopedSubEvents.length > 0 && !headBillForm.subEventId) {
+    if (openSubEvents.length > 0 && !headBillForm.subEventId) {
       setHeadBillForm((prev) => ({
         ...prev,
-        subEventId: String(scopedSubEvents[0].id),
+        subEventId: String(openSubEvents[0].id),
       }));
     }
-  }, [scopedSubEvents, headBillForm.subEventId]);
+  }, [openSubEvents, headBillForm.subEventId]);
 
   const scopedSubEventIds = useMemo(
     () => new Set(scopedSubEvents.map((se) => Number(se.id))),
@@ -312,12 +356,13 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   const closureQueue = useMemo(() => {
     return scopedSubEvents.filter(
       (se) =>
+        !isSubEventClosed(se) &&
         (se.closureRequested ||
           se.status === 'CLOSURE_PENDING' ||
           se.status === 'CLOSURE_REQUESTED') &&
         !se.studentHeadClosureApproved
     );
-  }, [scopedSubEvents]);
+  }, [scopedSubEvents, isSubEventClosed]);
 
   const toggleCreateId = (field, idVal) => {
     const numId = Number(idVal);
@@ -332,8 +377,12 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   const handleCreateSubEvent = async (e) => {
     e.preventDefault();
     const parentId = Number(newSubEvent.parentEventId);
-    if (!assignedMasterIds.has(parentId)) {
-      showBanner('error', 'Select one of your assigned Master Events.');
+    const parentMaster = openMasterEvents.find((m) => Number(m.id) === parentId);
+    if (!parentMaster) {
+      showBanner(
+        'error',
+        'Select an open (non-closed) Master Event assigned to you.'
+      );
       return;
     }
     if (!newSubEvent.name.trim()) {
@@ -343,9 +392,6 @@ export default function StudentHeadDashboard({ user, onLogout }) {
 
     setSubmitting(true);
     try {
-      const parentMaster = assignedMasterEvents.find(
-        (m) => Number(m.id) === parentId
-      );
       await backendApi.post('/subevents', {
         parentEventId: parentId,
         name: newSubEvent.name.trim(),
@@ -405,10 +451,12 @@ export default function StudentHeadDashboard({ user, onLogout }) {
       const extracted = ocrRes.data?.data || ocrRes.data || {};
       setHeadBillForm((prev) => ({
         ...prev,
-        vendorName: extracted.vendorName || extracted.vendor_name || prev.vendorName,
+        vendorName:
+          extracted.vendorName || extracted.vendor_name || prev.vendorName,
         billNo: extracted.billNo || extracted.bill_number || prev.billNo,
         billDate: extracted.billDate || extracted.bill_date || prev.billDate,
-        vendorGstin: extracted.vendorGstin || extracted.vendor_gstin || prev.vendorGstin,
+        vendorGstin:
+          extracted.vendorGstin || extracted.vendor_gstin || prev.vendorGstin,
         baseAmount:
           extracted.baseAmount !== undefined && extracted.baseAmount !== null
             ? String(extracted.baseAmount)
@@ -440,11 +488,14 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   // Student Head bill upload routes directly to PENDING_MAIN_HEAD
   const handleStudentHeadUploadBill = async (e) => {
     e.preventDefault();
-    const targetSub = scopedSubEvents.find(
+    const targetSub = openSubEvents.find(
       (se) => String(se.id) === String(headBillForm.subEventId)
     );
     if (!targetSub) {
-      showBanner('error', 'Select a sub-event under your assigned Master Event.');
+      showBanner(
+        'error',
+        'Select an open sub-event (closed events are read-only).'
+      );
       return;
     }
     if (!headBillForm.vendorName.trim() || !headBillForm.amount) {
@@ -517,6 +568,7 @@ export default function StudentHeadDashboard({ user, onLogout }) {
 
   const handleOpenFolder = async (subEvent) => {
     setSelectedFolder(subEvent);
+    setFolderBillTab('all');
     setFolderDetail(null);
     setLoadingFolder(true);
     try {
@@ -542,7 +594,7 @@ export default function StudentHeadDashboard({ user, onLogout }) {
     try {
       await backendApi.put(`/subevents/${subEventId}/verify-closure`, {
         role: 'STUDENT_HEAD',
-        userId: user?.id,
+        userId: String(user?.id || ''),
       });
       showBanner('success', 'Student Head closure approval recorded.');
       await fetchDashboardData();
@@ -555,6 +607,10 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   };
 
   const openAdvanceModal = (subEvent) => {
+    if (isSubEventClosed(subEvent)) {
+      showBanner('error', 'This event is CLOSED and read-only.');
+      return;
+    }
     setAdvanceTarget(subEvent);
     setAdvanceAmount(String(subEvent.advanceDisbursed ?? 0));
   };
@@ -586,6 +642,10 @@ export default function StudentHeadDashboard({ user, onLogout }) {
   };
 
   const openEditModal = async (subEvent) => {
+    if (isSubEventClosed(subEvent)) {
+      showBanner('error', 'This event is CLOSED and read-only.');
+      return;
+    }
     setEditTarget(subEvent);
     const [detailRes, leads] = await Promise.all([
       backendApi
@@ -662,6 +722,21 @@ export default function StudentHeadDashboard({ user, onLogout }) {
       return Number(subId) === Number(selectedFolder.id);
     });
   }, [scopedBills, selectedFolder]);
+
+  const filteredFolderBills = useMemo(() => {
+    if (folderBillTab === 'rejected') {
+      return folderBills.filter((b) => isSteppedBackOrRejected(b));
+    }
+    if (folderBillTab === 'pending') {
+      return folderBills.filter(
+        (b) => !isSteppedBackOrRejected(b) && b.status !== 'APPROVED'
+      );
+    }
+    if (folderBillTab === 'approved') {
+      return folderBills.filter((b) => b.status === 'APPROVED');
+    }
+    return folderBills;
+  }, [folderBills, folderBillTab]);
 
   const inputClass =
     'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
@@ -771,7 +846,9 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                       {assignedMasterEvents
                         .map(
                           (m) =>
-                            `${m.name}${m.eventYear ? ` (${m.eventYear})` : ''}`
+                            `${m.name}${m.eventYear ? ` (${m.eventYear})` : ''} [${
+                              m.status || 'ACTIVE'
+                            }]`
                         )
                         .join(', ')}
                     </div>
@@ -846,7 +923,13 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                                   / Cap: INR{' '}
                                   {(Number(se.budgetCap) || 0).toLocaleString(
                                     'en-IN'
-                                  )}
+                                  )}{' '}
+                                  &middot; Faculty Closure:{' '}
+                                  <strong>
+                                    {se.facultyClosureApproved
+                                      ? 'Approved'
+                                      : 'Pending'}
+                                  </strong>
                                 </div>
                               </div>
                               <button
@@ -876,213 +959,219 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                       </p>
                     </div>
 
-                    <form onSubmit={handleCreateSubEvent} className="space-y-4">
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Parent Master Event *
-                          </label>
-                          <select
-                            value={newSubEvent.parentEventId}
-                            onChange={(e) =>
-                              setNewSubEvent((prev) => ({
-                                ...prev,
-                                parentEventId: e.target.value,
-                                coordinatorIds: [],
-                                facultyIds: [],
-                              }))
-                            }
-                            required
-                            className={inputClass}
-                          >
-                            {assignedMasterEvents.map((m) => (
-                              <option key={m.id} value={m.id}>
-                                {m.name} {m.eventYear ? `(${m.eventYear})` : ''}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Sub-Event Name *
-                          </label>
-                          <input
-                            type="text"
-                            value={newSubEvent.name}
-                            onChange={(e) =>
-                              setNewSubEvent((p) => ({
-                                ...p,
-                                name: e.target.value,
-                              }))
-                            }
-                            placeholder="e.g., Hackathon"
-                            required
-                            className={inputClass}
-                          />
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Hosting Department / Branch *
-                          </label>
-                          <select
-                            value={newSubEvent.department}
-                            onChange={(e) =>
-                              setNewSubEvent((p) => ({
-                                ...p,
-                                department: e.target.value,
-                              }))
-                            }
-                            required
-                            className={inputClass}
-                          >
-                            {DEPARTMENTS.map((d) => (
-                              <option key={d} value={d}>
-                                {d}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Budget Cap (INR) *
-                          </label>
-                          <input
-                            type="number"
-                            min="0"
-                            value={newSubEvent.budgetCap}
-                            onChange={(e) =>
-                              setNewSubEvent((p) => ({
-                                ...p,
-                                budgetCap: e.target.value,
-                              }))
-                            }
-                            placeholder="e.g., 30000"
-                            required
-                            className={inputClass}
-                          />
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Advance Disbursed (INR, Optional)
-                          </label>
-                          <input
-                            type="number"
-                            min="0"
-                            value={newSubEvent.advanceDisbursed}
-                            onChange={(e) =>
-                              setNewSubEvent((p) => ({
-                                ...p,
-                                advanceDisbursed: e.target.value,
-                              }))
-                            }
-                            placeholder="0"
-                            className={inputClass}
-                          />
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-medium text-stone-600 mb-1">
-                            Description (Optional)
-                          </label>
-                          <input
-                            type="text"
-                            value={newSubEvent.description}
-                            onChange={(e) =>
-                              setNewSubEvent((p) => ({
-                                ...p,
-                                description: e.target.value,
-                              }))
-                            }
-                            placeholder="Brief notes"
-                            className={inputClass}
-                          />
-                        </div>
+                    {openMasterEvents.length === 0 ? (
+                      <div className="p-5 bg-stone-100 border border-stone-300 rounded-lg text-xs text-stone-700">
+                        All assigned Master Events are <strong>CLOSED</strong> and read-only. No new sub-events can be created.
                       </div>
+                    ) : (
+                      <form onSubmit={handleCreateSubEvent} className="space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Parent Master Event *
+                            </label>
+                            <select
+                              value={newSubEvent.parentEventId}
+                              onChange={(e) =>
+                                setNewSubEvent((prev) => ({
+                                  ...prev,
+                                  parentEventId: e.target.value,
+                                  coordinatorIds: [],
+                                  facultyIds: [],
+                                }))
+                              }
+                              required
+                              className={inputClass}
+                            >
+                              {openMasterEvents.map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.name} {m.eventYear ? `(${m.eventYear})` : ''}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
 
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
-                        <div className="p-4 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
-                          <p className="text-xs font-semibold text-stone-700">
-                            Available Student Coordinators (
-                            {newSubEvent.coordinatorIds.length} selected)
-                          </p>
-                          <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
-                            {availableLeads.coordinators.length === 0 ? (
-                              <p className="text-xs text-stone-400">
-                                No unassigned Student Coordinators available for this Master Event.
-                              </p>
-                            ) : (
-                              availableLeads.coordinators.map((c) => (
-                                <label
-                                  key={c.id}
-                                  className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={newSubEvent.coordinatorIds.includes(
-                                      Number(c.id)
-                                    )}
-                                    onChange={() =>
-                                      toggleCreateId('coordinatorIds', c.id)
-                                    }
-                                  />
-                                  <span className="font-medium">{c.name}</span>
-                                  <span className="text-stone-400 ml-auto">
-                                    {c.department || c.institutionalId}
-                                  </span>
-                                </label>
-                              ))
-                            )}
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Sub-Event Name *
+                            </label>
+                            <input
+                              type="text"
+                              value={newSubEvent.name}
+                              onChange={(e) =>
+                                setNewSubEvent((p) => ({
+                                  ...p,
+                                  name: e.target.value,
+                                }))
+                              }
+                              placeholder="e.g., Hackathon"
+                              required
+                              className={inputClass}
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Hosting Department / Branch *
+                            </label>
+                            <select
+                              value={newSubEvent.department}
+                              onChange={(e) =>
+                                setNewSubEvent((p) => ({
+                                  ...p,
+                                  department: e.target.value,
+                                }))
+                              }
+                              required
+                              className={inputClass}
+                            >
+                              {DEPARTMENTS.map((d) => (
+                                <option key={d} value={d}>
+                                  {d}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Budget Cap (INR) *
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={newSubEvent.budgetCap}
+                              onChange={(e) =>
+                                setNewSubEvent((p) => ({
+                                  ...p,
+                                  budgetCap: e.target.value,
+                                }))
+                              }
+                              placeholder="e.g., 30000"
+                              required
+                              className={inputClass}
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Advance Disbursed (INR, Optional)
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={newSubEvent.advanceDisbursed}
+                              onChange={(e) =>
+                                setNewSubEvent((p) => ({
+                                  ...p,
+                                  advanceDisbursed: e.target.value,
+                                }))
+                              }
+                              placeholder="0"
+                              className={inputClass}
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-medium text-stone-600 mb-1">
+                              Description (Optional)
+                            </label>
+                            <input
+                              type="text"
+                              value={newSubEvent.description}
+                              onChange={(e) =>
+                                setNewSubEvent((p) => ({
+                                  ...p,
+                                  description: e.target.value,
+                                }))
+                              }
+                              placeholder="Brief notes"
+                              className={inputClass}
+                            />
                           </div>
                         </div>
 
-                        <div className="p-4 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
-                          <p className="text-xs font-semibold text-stone-700">
-                            Available Faculty Heads (
-                            {newSubEvent.facultyIds.length} selected)
-                          </p>
-                          <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
-                            {availableLeads.faculty.length === 0 ? (
-                              <p className="text-xs text-stone-400">
-                                No unassigned Faculty Heads available for this Master Event.
-                              </p>
-                            ) : (
-                              availableLeads.faculty.map((f) => (
-                                <label
-                                  key={f.id}
-                                  className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={newSubEvent.facultyIds.includes(
-                                      Number(f.id)
-                                    )}
-                                    onChange={() =>
-                                      toggleCreateId('facultyIds', f.id)
-                                    }
-                                  />
-                                  <span className="font-medium">{f.name}</span>
-                                  <span className="text-stone-400 ml-auto">
-                                    {f.department || f.institutionalId}
-                                  </span>
-                                </label>
-                              ))
-                            )}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                          <div className="p-4 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                            <p className="text-xs font-semibold text-stone-700">
+                              Available Student Coordinators (
+                              {newSubEvent.coordinatorIds.length} selected)
+                            </p>
+                            <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                              {availableLeads.coordinators.length === 0 ? (
+                                <p className="text-xs text-stone-400">
+                                  No unassigned Student Coordinators available for this Master Event.
+                                </p>
+                              ) : (
+                                availableLeads.coordinators.map((c) => (
+                                  <label
+                                    key={c.id}
+                                    className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={newSubEvent.coordinatorIds.includes(
+                                        Number(c.id)
+                                      )}
+                                      onChange={() =>
+                                        toggleCreateId('coordinatorIds', c.id)
+                                      }
+                                    />
+                                    <span className="font-medium">{c.name}</span>
+                                    <span className="text-stone-400 ml-auto">
+                                      {c.department || c.institutionalId}
+                                    </span>
+                                  </label>
+                                ))
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="p-4 bg-sage-50/60 border border-sage-200/80 rounded-lg space-y-2">
+                            <p className="text-xs font-semibold text-stone-700">
+                              Available Faculty Heads (
+                              {newSubEvent.facultyIds.length} selected)
+                            </p>
+                            <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                              {availableLeads.faculty.length === 0 ? (
+                                <p className="text-xs text-stone-400">
+                                  No unassigned Faculty Heads available for this Master Event.
+                                </p>
+                              ) : (
+                                availableLeads.faculty.map((f) => (
+                                  <label
+                                    key={f.id}
+                                    className="flex items-center gap-2 text-xs text-stone-700 bg-white px-2.5 py-1.5 rounded border border-sage-100 cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={newSubEvent.facultyIds.includes(
+                                        Number(f.id)
+                                      )}
+                                      onChange={() =>
+                                        toggleCreateId('facultyIds', f.id)
+                                      }
+                                    />
+                                    <span className="font-medium">{f.name}</span>
+                                    <span className="text-stone-400 ml-auto">
+                                      {f.department || f.institutionalId}
+                                    </span>
+                                  </label>
+                                ))
+                              )}
+                            </div>
                           </div>
                         </div>
-                      </div>
 
-                      <button
-                        type="submit"
-                        disabled={submitting}
-                        className="px-5 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer"
-                      >
-                        {submitting ? 'Creating...' : 'Create Sub-Event'}
-                      </button>
-                    </form>
+                        <button
+                          type="submit"
+                          disabled={submitting}
+                          className="px-5 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer"
+                        >
+                          {submitting ? 'Creating...' : 'Create Sub-Event'}
+                        </button>
+                      </form>
+                    )}
                   </section>
                 )}
 
@@ -1098,9 +1187,9 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                       </p>
                     </div>
 
-                    {scopedSubEvents.length === 0 ? (
+                    {openSubEvents.length === 0 ? (
                       <p className="text-xs text-stone-500">
-                        Create a sub-event under your assigned Master Event first before uploading a bill.
+                        No open sub-events available under your assigned Master Event(s) (closed events are read-only).
                       </p>
                     ) : (
                       <form
@@ -1123,7 +1212,7 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                               required
                               className={inputClass}
                             >
-                              {scopedSubEvents.map((se) => (
+                              {openSubEvents.map((se) => (
                                 <option key={se.id} value={se.id}>
                                   {se.name} ({se.department || 'General'})
                                 </option>
@@ -1266,6 +1355,7 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                         const cap = Number(se.budgetCap) || 0;
                         const pct =
                           cap > 0 ? Math.min(100, (spent / cap) * 100) : 0;
+                        const closed = isSubEventClosed(se);
 
                         return (
                           <div
@@ -1277,8 +1367,14 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                                 <h3 className="font-semibold text-stone-900">
                                   {se.name}
                                 </h3>
-                                <span className="text-[11px] px-2 py-0.5 rounded bg-sage-50 border border-sage-200 text-sage-800 font-medium">
-                                  {se.status || 'OPEN'}
+                                <span
+                                  className={`text-[11px] px-2 py-0.5 rounded border font-medium ${
+                                    closed
+                                      ? 'bg-stone-100 border-stone-300 text-stone-800'
+                                      : 'bg-sage-50 border-sage-200 text-sage-800'
+                                  }`}
+                                >
+                                  {closed ? 'CLOSED' : se.status || 'ACTIVE'}
                                 </span>
                               </div>
                               <p className="text-xs text-stone-500 mt-1">
@@ -1310,20 +1406,24 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                               >
                                 Open Folder
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => openAdvanceModal(se)}
-                                className="px-3 py-1.5 text-xs font-medium rounded-lg border border-sage-200 text-stone-700 hover:bg-sage-50 cursor-pointer"
-                              >
-                                Update Advance
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => openEditModal(se)}
-                                className="px-3 py-1.5 text-xs font-medium rounded-lg border border-sage-200 text-stone-700 hover:bg-sage-50 cursor-pointer"
-                              >
-                                Edit
-                              </button>
+                              {!closed && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => openAdvanceModal(se)}
+                                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-sage-200 text-stone-700 hover:bg-sage-50 cursor-pointer"
+                                  >
+                                    Update Advance
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openEditModal(se)}
+                                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-sage-200 text-stone-700 hover:bg-sage-50 cursor-pointer"
+                                  >
+                                    Edit
+                                  </button>
+                                </>
+                              )}
                             </div>
                           </div>
                         );
@@ -1381,9 +1481,17 @@ export default function StudentHeadDashboard({ user, onLogout }) {
         <div className="fixed inset-0 bg-stone-900/40 flex items-center justify-center p-4 z-40">
           <div className="bg-white border border-sage-200 rounded-xl max-w-5xl w-full max-h-[88vh] overflow-y-auto p-6 space-y-5">
             <div className="flex items-center justify-between pb-3 border-b border-sage-100">
-              <h3 className="text-base font-semibold text-stone-900">
-                Folder: {selectedFolder.name}
-              </h3>
+              <div>
+                <h3 className="text-base font-semibold text-stone-900">
+                  Folder: {selectedFolder.name}
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Status:{' '}
+                  {isSubEventClosed(selectedFolder)
+                    ? 'CLOSED (Read-Only)'
+                    : selectedFolder.status || 'ACTIVE'}
+                </p>
+              </div>
               <button
                 type="button"
                 onClick={() => {
@@ -1470,57 +1578,106 @@ export default function StudentHeadDashboard({ user, onLogout }) {
                   bills={folderBills}
                 />
 
-                <div>
-                  <div className="font-semibold text-sm text-stone-800 mb-2">
-                    Bills in Folder ({folderBills.length})
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-semibold text-sm text-stone-800">
+                      Bills in Folder ({filteredFolderBills.length})
+                    </div>
+                    <div className="flex gap-1.5 text-xs">
+                      {[
+                        { id: 'all', label: `All (${folderBills.length})` },
+                        {
+                          id: 'pending',
+                          label: `Pending (${
+                            folderBills.filter(
+                              (b) =>
+                                !isSteppedBackOrRejected(b) &&
+                                b.status !== 'APPROVED'
+                            ).length
+                          })`,
+                        },
+                        {
+                          id: 'rejected',
+                          label: `Rejected (${
+                            folderBills.filter((b) =>
+                              isSteppedBackOrRejected(b)
+                            ).length
+                          })`,
+                        },
+                        {
+                          id: 'approved',
+                          label: `Approved (${
+                            folderBills.filter((b) => b.status === 'APPROVED')
+                              .length
+                          })`,
+                        },
+                      ].map((t) => (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => setFolderBillTab(t.id)}
+                          className={`px-2.5 py-1 rounded border cursor-pointer ${
+                            folderBillTab === t.id
+                              ? 'bg-sage-600 text-white border-sage-600'
+                              : 'bg-white text-stone-600 border-sage-200'
+                          }`}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  {folderBills.length === 0 ? (
+                  {filteredFolderBills.length === 0 ? (
                     <p className="text-xs text-stone-500">
-                      No bills linked to this sub-event folder.
+                      No bills in this filter view.
                     </p>
                   ) : (
                     <div className="border border-sage-200 rounded-lg divide-y divide-sage-100 text-xs">
-                      {folderBills.map((b) => (
-                        <div
-                          key={b.id}
-                          className="p-2.5 flex items-center justify-between gap-3"
-                        >
-                          <div>
-                            <div className="font-medium text-stone-900">
-                              {b.vendorName || `Bill #${b.id}`}
+                      {filteredFolderBills.map((b) => {
+                        const rejectedFlag = isSteppedBackOrRejected(b);
+                        return (
+                          <div
+                            key={b.id}
+                            className="p-2.5 flex items-center justify-between gap-3"
+                          >
+                            <div>
+                              <div className="font-medium text-stone-900">
+                                {b.vendorName || `Bill #${b.id}`}
+                              </div>
+                              <div className="text-stone-500">
+                                Status:{' '}
+                                <span
+                                  className={`px-1.5 py-0.5 rounded border text-[10px] font-medium ${getStatusBadgeClass(
+                                    b
+                                  )}`}
+                                >
+                                  {rejectedFlag ? 'REJECTED' : b.status}
+                                </span>
+                              </div>
                             </div>
-                            <div className="text-stone-500">
-                              Status:{' '}
-                              <span
-                                className={`px-1.5 py-0.5 rounded border text-[10px] font-medium ${getStatusBadgeClass(
-                                  b.status
-                                )}`}
-                              >
-                                {b.status}
+                            <div className="flex items-center gap-2.5">
+                              <span className="font-semibold text-stone-900">
+                                INR{' '}
+                                {Number(b.amount || 0).toLocaleString('en-IN')}
                               </span>
+                              <button
+                                type="button"
+                                onClick={() => setSelectedBill(b)}
+                                className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded text-xs font-medium cursor-pointer"
+                              >
+                                Inspect
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setSelectedBillForAudit(b.id)}
+                                className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded text-xs font-medium cursor-pointer"
+                              >
+                                Logs
+                              </button>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2.5">
-                            <span className="font-semibold text-stone-900">
-                              INR {Number(b.amount || 0).toLocaleString('en-IN')}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => setSelectedBill(b)}
-                              className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded text-xs font-medium cursor-pointer"
-                            >
-                              Inspect
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setSelectedBillForAudit(b.id)}
-                              className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded text-xs font-medium cursor-pointer"
-                            >
-                              Logs
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -1537,10 +1694,15 @@ export default function StudentHeadDashboard({ user, onLogout }) {
             <div className="flex items-center justify-between pb-3 border-b border-sage-100">
               <div>
                 <h3 className="text-base font-semibold text-stone-900">
-                  {selectedBill.vendorName} #{selectedBill.billNo || selectedBill.id}
+                  {selectedBill.vendorName} #
+                  {selectedBill.billNo || selectedBill.id}
                 </h3>
                 <p className="text-xs text-stone-500">
-                  Status: {selectedBill.status} &middot; Amount: INR{' '}
+                  Status:{' '}
+                  {isSteppedBackOrRejected(selectedBill)
+                    ? 'REJECTED'
+                    : selectedBill.status}{' '}
+                  &middot; Amount: INR{' '}
                   {Number(selectedBill.amount || 0).toLocaleString('en-IN')}
                 </p>
               </div>

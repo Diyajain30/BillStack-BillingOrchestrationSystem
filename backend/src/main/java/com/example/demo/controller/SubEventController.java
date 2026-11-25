@@ -1,7 +1,9 @@
 package com.example.demo.controller;
 
+import com.example.demo.entity.Bill;
 import com.example.demo.entity.SubEvent;
 import com.example.demo.entity.User;
+import com.example.demo.repository.BillRepository;
 import com.example.demo.repository.SubEventRepository;
 import com.example.demo.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,6 +29,9 @@ public class SubEventController {
 
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private BillRepository billRepository;
 
     private Double parseDoubleSafe(Object val, double fallback) {
         if (val == null || val.toString().trim().isEmpty()) return fallback;
@@ -103,6 +108,17 @@ public class SubEventController {
         return r.equals("FACULTY") || r.contains("FACULTY") || r.contains("TEACHER");
     }
 
+    private boolean isClosedStatus(String status) {
+        return status != null && "CLOSED".equalsIgnoreCase(status.trim());
+    }
+
+    private boolean isParentClosed(SubEvent ev, List<SubEvent> allEvents) {
+        if (ev == null || ev.getParentEventId() == null) return false;
+        return allEvents.stream()
+                .filter(p -> ev.getParentEventId().equals(p.getId()))
+                .anyMatch(p -> isClosedStatus(p.getStatus()));
+    }
+
     private boolean isAssignedToMasterEvent(SubEvent ev, Long userId) {
         if (ev == null || userId == null) return false;
         if (userId.equals(ev.getMainHeadId())) return true;
@@ -125,10 +141,6 @@ public class SubEventController {
         return assignedMasterIds.contains(ev.getParentEventId());
     }
 
-    /**
-     * Returns all user IDs already assigned as coordinator or faculty to any OTHER sub-event
-     * under the same Master Event (parentEventId).
-     */
     private Set<Long> getBusyUserIdsInMasterEvent(Long parentEventId, Long excludeSubEventId) {
         Set<Long> busy = new HashSet<>();
         if (parentEventId == null) return busy;
@@ -193,12 +205,13 @@ public class SubEventController {
         if (subEventOpt.isEmpty()) return ResponseEntity.notFound().build();
 
         SubEvent subEvent = subEventOpt.get();
+        List<SubEvent> allEvents = subEventRepository.findAll();
         if (isScopedHeadRole(role)) {
             if (userId == null) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
                         .body(Map.of("message", "userId is required for scoped head access."));
             }
-            Set<Long> assignedMasterIds = getAssignedMasterEventIds(subEventRepository.findAll(), userId);
+            Set<Long> assignedMasterIds = getAssignedMasterEventIds(allEvents, userId);
             if (!canAccessEvent(subEvent, userId, role, assignedMasterIds)) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
                         .body(Map.of("message", "Access denied: event is outside your assigned Master Event scope."));
@@ -207,6 +220,7 @@ public class SubEventController {
 
         List<User> facultyHeads = resolveAssignedUsers(subEvent, true);
         List<User> coordinators = resolveAssignedUsers(subEvent, false);
+        boolean readOnly = isClosedStatus(subEvent.getStatus()) || isParentClosed(subEvent, allEvents);
 
         Map<String, Object> res = new HashMap<>();
         res.put("id", subEvent.getId());
@@ -218,6 +232,7 @@ public class SubEventController {
         res.put("advanceDisbursed", subEvent.getAdvanceDisbursed());
         res.put("totalSpent", subEvent.getTotalSpent());
         res.put("status", subEvent.getStatus());
+        res.put("readOnly", readOnly);
         res.put("wingName", subEvent.getWingName());
         res.put("parentEventId", subEvent.getParentEventId());
         res.put("mainHeadId", subEvent.getMainHeadId());
@@ -275,6 +290,18 @@ public class SubEventController {
                 return ResponseEntity.badRequest().body(Map.of("message", "Event name is required."));
             }
 
+            List<SubEvent> allEvents = subEventRepository.findAll();
+            Long parentEventId = parseLongSafe(payload.get("parentEventId"));
+            if (parentEventId != null) {
+                Optional<SubEvent> parentOpt = allEvents.stream()
+                        .filter(ev -> parentEventId.equals(ev.getId()))
+                        .findFirst();
+                if (parentOpt.isPresent() && isClosedStatus(parentOpt.get().getStatus())) {
+                    return ResponseEntity.status(HttpStatus.CONFLICT)
+                            .body(Map.of("message", "Master Event is CLOSED and read-only; new sub-events cannot be added."));
+                }
+            }
+
             String department = payload.get("department") != null && !payload.get("department").toString().trim().isEmpty()
                     ? payload.get("department").toString().trim()
                     : null;
@@ -287,7 +314,6 @@ public class SubEventController {
             String wingName = payload.get("wingName") != null && !payload.get("wingName").toString().trim().isEmpty()
                     ? payload.get("wingName").toString().trim()
                     : null;
-            Long parentEventId = parseLongSafe(payload.get("parentEventId"));
 
             List<Long> mainHeadIdList = extractUserIds(
                     payload.containsKey("mainHeadIds") ? payload.get("mainHeadIds") : payload.get("mainHeadId"));
@@ -311,7 +337,7 @@ public class SubEventController {
                     return ResponseEntity.status(HttpStatus.FORBIDDEN)
                             .body(Map.of("message", "Student Heads can only create sub-events under an assigned Master Event."));
                 }
-                Set<Long> assignedMasterIds = getAssignedMasterEventIds(subEventRepository.findAll(), actorUserId);
+                Set<Long> assignedMasterIds = getAssignedMasterEventIds(allEvents, actorUserId);
                 if (!assignedMasterIds.contains(parentEventId)) {
                     return ResponseEntity.status(HttpStatus.FORBIDDEN)
                             .body(Map.of("message", "Access denied: parent Master Event is not assigned to you."));
@@ -389,6 +415,13 @@ public class SubEventController {
             if (subEventOpt.isEmpty()) return ResponseEntity.notFound().build();
 
             SubEvent subEvent = subEventOpt.get();
+            List<SubEvent> allEvents = subEventRepository.findAll();
+
+            if (isClosedStatus(subEvent.getStatus()) || isParentClosed(subEvent, allEvents)) {
+                return ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(Map.of("message", "This event is CLOSED and read-only; no further changes are allowed."));
+            }
+
             String actorRole = payload.get("actorRole") != null ? payload.get("actorRole").toString() : null;
             Long actorUserId = parseLongSafe(payload.get("actorUserId"));
 
@@ -397,7 +430,7 @@ public class SubEventController {
                     return ResponseEntity.status(HttpStatus.FORBIDDEN)
                             .body(Map.of("message", "actorUserId is required for scoped head updates."));
                 }
-                Set<Long> assignedMasterIds = getAssignedMasterEventIds(subEventRepository.findAll(), actorUserId);
+                Set<Long> assignedMasterIds = getAssignedMasterEventIds(allEvents, actorUserId);
                 if (!canAccessEvent(subEvent, actorUserId, actorRole, assignedMasterIds)) {
                     return ResponseEntity.status(HttpStatus.FORBIDDEN)
                             .body(Map.of("message", "Access denied: event is outside your assigned Master Event scope."));
@@ -427,7 +460,13 @@ public class SubEventController {
                 subEvent.setWingName(payload.get("wingName") != null ? payload.get("wingName").toString().trim() : null);
             }
             if (payload.containsKey("status") && payload.get("status") != null && !payload.get("status").toString().trim().isEmpty()) {
-                subEvent.setStatus(payload.get("status").toString().trim());
+                String requestedStatus = payload.get("status").toString().trim().toUpperCase();
+                if ("CLOSED".equals(requestedStatus) && subEvent.getParentEventId() == null) {
+                    ResponseEntity<?> closeCheck = closeMasterEventInternal(subEvent, allEvents);
+                    if (closeCheck.getStatusCode() != HttpStatus.OK) return closeCheck;
+                } else {
+                    subEvent.setStatus(requestedStatus);
+                }
             }
             if (payload.containsKey("parentEventId")) {
                 subEvent.setParentEventId(parseLongSafe(payload.get("parentEventId")));
@@ -535,6 +574,12 @@ public class SubEventController {
         if (subEventOpt.isEmpty()) return ResponseEntity.notFound().build();
 
         SubEvent subEvent = subEventOpt.get();
+        List<SubEvent> allEvents = subEventRepository.findAll();
+        if (isClosedStatus(subEvent.getStatus()) || isParentClosed(subEvent, allEvents)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("message", "This event is CLOSED and read-only."));
+        }
+
         String actorRole = payload.get("actorRole") != null ? payload.get("actorRole").toString() : null;
         Long actorUserId = parseLongSafe(payload.get("actorUserId"));
         if (isScopedHeadRole(actorRole)) {
@@ -542,7 +587,7 @@ public class SubEventController {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
                         .body(Map.of("message", "actorUserId is required for scoped head advance updates."));
             }
-            Set<Long> assignedMasterIds = getAssignedMasterEventIds(subEventRepository.findAll(), actorUserId);
+            Set<Long> assignedMasterIds = getAssignedMasterEventIds(allEvents, actorUserId);
             if (!canAccessEvent(subEvent, actorUserId, actorRole, assignedMasterIds)) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN)
                         .body(Map.of("message", "Access denied: event is outside your assigned Master Event scope."));
@@ -561,6 +606,18 @@ public class SubEventController {
     @PostMapping("/{id}/request-closure")
     public ResponseEntity<?> requestClosure(@PathVariable Long id) {
         return subEventRepository.findById(id).map(subEvent -> {
+            if (isClosedStatus(subEvent.getStatus())) {
+                return ResponseEntity.ok(subEvent);
+            }
+            List<Bill> subBills = billRepository.findAll().stream()
+                    .filter(b -> id.equals(b.getSubEventId()))
+                    .toList();
+            boolean hasUnapproved = subBills.stream()
+                    .anyMatch(b -> !"APPROVED".equalsIgnoreCase(b.getStatus()));
+            if (hasUnapproved) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "message", "All bills in this sub-event must be approved before requesting closure."));
+            }
             subEvent.setClosureRequested(true);
             subEvent.setStatus("CLOSURE_PENDING");
             return ResponseEntity.ok(subEventRepository.save(subEvent));
@@ -572,6 +629,9 @@ public class SubEventController {
         String role = payload.get("role");
         Long userId = parseLongSafe(payload.get("userId"));
         return subEventRepository.findById(id).map(subEvent -> {
+            if (isClosedStatus(subEvent.getStatus())) {
+                return ResponseEntity.ok(subEvent);
+            }
             if (isScopedHeadRole(role)) {
                 if (userId == null) {
                     return ResponseEntity.status(HttpStatus.FORBIDDEN)
@@ -597,6 +657,62 @@ public class SubEventController {
 
             return ResponseEntity.ok(subEventRepository.save(subEvent));
         }).orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/{id}/close-master")
+    public ResponseEntity<?> closeMasterEvent(@PathVariable Long id, @RequestBody(required = false) Map<String, Object> payload) {
+        Optional<SubEvent> masterOpt = subEventRepository.findById(id);
+        if (masterOpt.isEmpty()) return ResponseEntity.notFound().build();
+
+        SubEvent master = masterOpt.get();
+        if (master.getParentEventId() != null) {
+            return ResponseEntity.badRequest().body(Map.of("message", "Event is not a Master Event."));
+        }
+
+        Long userId = payload != null ? parseLongSafe(payload.get("userId")) : null;
+        String role = payload != null && payload.get("role") != null ? payload.get("role").toString() : "MAIN_EVENT_HEAD";
+        List<SubEvent> allEvents = subEventRepository.findAll();
+
+        if (isScopedHeadRole(role)) {
+            if (userId == null || !isAssignedToMasterEvent(master, userId)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                        .body(Map.of("message", "Access denied: Master Event is not assigned to you."));
+            }
+        }
+
+        return closeMasterEventInternal(master, allEvents);
+    }
+
+    private ResponseEntity<?> closeMasterEventInternal(SubEvent master, List<SubEvent> allEvents) {
+        List<SubEvent> children = allEvents.stream()
+                .filter(ev -> master.getId().equals(ev.getParentEventId()))
+                .toList();
+
+        Set<Long> childIds = children.stream()
+                .map(SubEvent::getId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        boolean anyBillNotApproved = billRepository.findAll().stream()
+                .filter(b -> b.getSubEventId() != null && childIds.contains(b.getSubEventId()))
+                .anyMatch(b -> !"APPROVED".equalsIgnoreCase(b.getStatus()));
+
+        if (anyBillNotApproved) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "message", "All bills across all sub-events in this Master Event must be approved before closing."));
+        }
+
+        for (SubEvent child : children) {
+            child.setClosureRequested(true);
+            child.setFacultyClosureApproved(true);
+            child.setStudentHeadClosureApproved(true);
+            child.setStatus("CLOSED");
+            subEventRepository.save(child);
+        }
+
+        master.setStatus("CLOSED");
+        SubEvent savedMaster = subEventRepository.save(master);
+        return ResponseEntity.ok(savedMaster);
     }
 
     @PutMapping("/{id}/sanction-closure")

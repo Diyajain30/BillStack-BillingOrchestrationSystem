@@ -25,9 +25,19 @@ function parseIdList(csvOrArray) {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
-  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
 
@@ -60,9 +70,12 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
   const [reviewRemark, setReviewRemark] = useState('');
 
   const [showRejectModal, setShowRejectModal] = useState(false);
-  const [rejectionReason, setRejectionReason] = useState("Amount doesn't match the bill");
+  const [rejectionReason, setRejectionReason] = useState(
+    "Amount doesn't match the bill"
+  );
   const [rejectionRemark, setRejectionRemark] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
+  const [closingMasterId, setClosingMasterId] = useState(null);
 
   const todayStr = formatDateDDMMYYYY();
   const currentUserId = Number(user?.id);
@@ -81,7 +94,6 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
     navigate('/', { replace: true });
   };
 
-  // Shared across all Main Event Heads and Student Heads assigned to the Master Event(s)
   const fetchDashboardData = useCallback(async () => {
     setLoading(true);
     try {
@@ -119,7 +131,9 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
         const isMain =
           (ev.mainHeadId != null && Number(ev.mainHeadId) === currentUserId) ||
           mainHeadList.includes(currentUserId);
-        const isStudentHead = parseIdList(ev.studentHeadIds).includes(currentUserId);
+        const isStudentHead = parseIdList(ev.studentHeadIds).includes(
+          currentUserId
+        );
         return isMain || isStudentHead;
       })
       .sort((a, b) => (Number(b.eventYear) || 0) - (Number(a.eventYear) || 0));
@@ -130,9 +144,31 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
     [assignedMasterEvents]
   );
 
+  const masterStatusById = useMemo(() => {
+    const map = new Map();
+    assignedMasterEvents.forEach((m) => {
+      map.set(Number(m.id), String(m.status || '').toUpperCase());
+    });
+    return map;
+  }, [assignedMasterEvents]);
+
+  const isSubEventClosed = useCallback(
+    (se) => {
+      if (!se) return false;
+      if (String(se.status || '').toUpperCase() === 'CLOSED') return true;
+      if (se.parentEventId != null) {
+        return masterStatusById.get(Number(se.parentEventId)) === 'CLOSED';
+      }
+      return false;
+    },
+    [masterStatusById]
+  );
+
   const scopedSubEvents = useMemo(() => {
     return events.filter(
-      (ev) => ev.parentEventId != null && assignedMasterIds.has(Number(ev.parentEventId))
+      (ev) =>
+        ev.parentEventId != null &&
+        assignedMasterIds.has(Number(ev.parentEventId))
     );
   }, [events, assignedMasterIds]);
 
@@ -149,13 +185,84 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
   }, [bills, scopedSubEventIds]);
 
   const pendingMainHeadBills = useMemo(
-    () => scopedBills.filter((b) => b.status === 'PENDING_MAIN_HEAD'),
+    () =>
+      scopedBills.filter(
+        (b) => b.status === 'PENDING_MAIN_HEAD' && !isSteppedBackOrRejected(b)
+      ),
     [scopedBills]
   );
 
+  const rejectedScopedBills = useMemo(
+    () => scopedBills.filter((b) => isSteppedBackOrRejected(b)),
+    [scopedBills]
+  );
+
+  // Check whether a Master Event can be closed: all sub-event bills exist and are APPROVED
+  const masterClosureEligibility = useMemo(() => {
+    const map = new Map();
+    assignedMasterEvents.forEach((m) => {
+      const mId = Number(m.id);
+      const alreadyClosed = String(m.status || '').toUpperCase() === 'CLOSED';
+      const children = scopedSubEvents.filter(
+        (se) => Number(se.parentEventId) === mId
+      );
+      const childIds = new Set(children.map((c) => Number(c.id)));
+      const childBills = scopedBills.filter((b) => {
+        const subId = b.subEventId ?? b.sub_event_id ?? b.eventId ?? b.event_id;
+        return subId != null && childIds.has(Number(subId));
+      });
+      const canClose =
+        !alreadyClosed &&
+        childBills.length > 0 &&
+        childBills.every((b) => b.status === 'APPROVED');
+      map.set(mId, {
+        alreadyClosed,
+        canClose,
+        totalBills: childBills.length,
+        approvedBills: childBills.filter((b) => b.status === 'APPROVED').length,
+      });
+    });
+    return map;
+  }, [assignedMasterEvents, scopedSubEvents, scopedBills]);
+
+  const handleCloseMasterEvent = async (masterEvent) => {
+    if (!masterEvent?.id) return;
+    const info = masterClosureEligibility.get(Number(masterEvent.id));
+    if (!info?.canClose) {
+      showBanner(
+        'error',
+        'All bills across all sub-events in this Master Event must be approved before closing.'
+      );
+      return;
+    }
+
+    setClosingMasterId(masterEvent.id);
+    try {
+      await backendApi.post(`/subevents/${masterEvent.id}/close-master`, {
+        userId: user?.id,
+        role: user?.role || 'MAIN_EVENT_HEAD',
+      });
+      showBanner(
+        'success',
+        `Master Event "${masterEvent.name}" is now CLOSED and read-only.`
+      );
+      await fetchDashboardData();
+    } catch (err) {
+      showBanner(
+        'error',
+        err.response?.data?.message || 'Failed to close Master Event.'
+      );
+    } finally {
+      setClosingMasterId(null);
+    }
+  };
+
   // Dynamic totals calculated strictly from fully APPROVED bills
   const totals = useMemo(() => {
-    const budget = scopedSubEvents.reduce((sum, se) => sum + (Number(se.budgetCap) || 0), 0);
+    const budget = scopedSubEvents.reduce(
+      (sum, se) => sum + (Number(se.budgetCap) || 0),
+      0
+    );
     const spent = scopedBills
       .filter((b) => b.status === 'APPROVED')
       .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
@@ -168,7 +275,10 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
 
   const getApprovedSpentForSubEvent = (subEventId) =>
     scopedBills
-      .filter((b) => Number(b.subEventId) === Number(subEventId) && b.status === 'APPROVED')
+      .filter(
+        (b) =>
+          Number(b.subEventId) === Number(subEventId) && b.status === 'APPROVED'
+      )
       .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
 
   const handleOpenFolder = async (subEvent) => {
@@ -185,7 +295,10 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
       setFolderDetail(res.data);
     } catch (err) {
       console.error('Failed to inspect sub-event folder:', err);
-      showBanner('error', err.response?.data?.message || 'Unable to open folder.');
+      showBanner(
+        'error',
+        err.response?.data?.message || 'Unable to open folder.'
+      );
       setSelectedFolder(null);
     } finally {
       setLoadingFolder(false);
@@ -239,13 +352,16 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
       closeReviewModals();
       await fetchDashboardData();
     } catch (err) {
-      showBanner('error', err.response?.data?.message || 'Failed to approve bill.');
+      showBanner(
+        'error',
+        err.response?.data?.message || 'Failed to approve bill.'
+      );
     } finally {
       setActionLoading(false);
     }
   };
 
-  // Step-back rejection loop: compulsory remark, steps back to previous stage (Faculty or Coordinator)
+  // Step-back rejection loop: compulsory remark, returns to previous stage and appears in Rejected
   const handleConfirmReject = async () => {
     if (!selectedBill) return;
     if (!rejectionRemark.trim()) {
@@ -269,12 +385,15 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
       });
       showBanner(
         'success',
-        `Bill #${selectedBill.billNo || selectedBill.id} rejected and stepped back with compulsory remark.`
+        `Bill #${selectedBill.billNo || selectedBill.id} rejected and moved to Rejected bills.`
       );
       closeReviewModals();
       await fetchDashboardData();
     } catch (err) {
-      showBanner('error', err.response?.data?.message || 'Failed to reject bill.');
+      showBanner(
+        'error',
+        err.response?.data?.message || 'Failed to reject bill.'
+      );
     } finally {
       setActionLoading(false);
     }
@@ -293,14 +412,36 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
 
   const navItems = [
     { id: 'overview', label: 'Overview' },
-    { id: 'pending', label: 'Pending Approvals', count: pendingMainHeadBills.length },
+    {
+      id: 'pending',
+      label: 'Pending Approvals',
+      count: pendingMainHeadBills.length,
+    },
+    {
+      id: 'rejected',
+      label: 'Rejected Bills',
+      count: rejectedScopedBills.length,
+    },
     { id: 'all', label: 'All Scoped Bills', count: scopedBills.length },
     { id: 'folders', label: 'Sub-Event Folders', count: scopedSubEvents.length },
     { id: 'profile', label: 'Profile' },
   ];
 
-  const displayedBills = activeTab === 'pending' ? pendingMainHeadBills : scopedBills;
-  const isPendingMainHead = selectedBill?.status === 'PENDING_MAIN_HEAD';
+  const displayedBills =
+    activeTab === 'pending'
+      ? pendingMainHeadBills
+      : activeTab === 'rejected'
+      ? rejectedScopedBills
+      : scopedBills;
+
+  const isPendingMainHead =
+    selectedBill?.status === 'PENDING_MAIN_HEAD' &&
+    !isSteppedBackOrRejected(selectedBill) &&
+    !isSubEventClosed(
+      scopedSubEvents.find(
+        (se) => Number(se.id) === Number(selectedBill?.subEventId)
+      )
+    );
 
   return (
     <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
@@ -309,9 +450,13 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
           <div className="flex items-center gap-3">
             <span className="h-2.5 w-2.5 rounded-full bg-sage-600" />
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-sage-900">BillStack</span>
+              <span className="text-sm font-semibold text-sage-900">
+                BillStack
+              </span>
               <span className="text-stone-300">/</span>
-              <h1 className="text-sm font-medium text-stone-700">Main Event Head Portal</h1>
+              <h1 className="text-sm font-medium text-stone-700">
+                Main Event Head Portal
+              </h1>
             </div>
           </div>
 
@@ -357,6 +502,8 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                     className={`text-xs px-2 py-0.5 rounded-md border ${
                       tab.id === 'pending' && tab.count > 0
                         ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : tab.id === 'rejected' && tab.count > 0
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
                         : 'bg-white text-stone-600 border-sage-200'
                     }`}
                   >
@@ -383,27 +530,73 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
             )}
 
             {loading ? (
-              <div className="text-sm text-stone-500">Loading assigned Master Events...</div>
+              <div className="text-sm text-stone-500">
+                Loading assigned Master Events...
+              </div>
             ) : assignedMasterEvents.length === 0 ? (
               <div className="bg-white border border-sage-200 rounded-xl p-6 text-sm text-stone-600">
                 No Master Event is assigned to your account yet. Once an Admin assigns you to a Master Event, its sub-events and bills will appear here.
               </div>
             ) : (
               <>
-                <div className="bg-white border border-sage-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="text-[11px] uppercase tracking-wider text-stone-400 font-semibold">
-                      Scoped Master Event(s)
+                <div className="bg-white border border-sage-200 rounded-xl p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] uppercase tracking-wider text-stone-400 font-semibold">
+                        Scoped Master Event(s)
+                      </div>
+                      <div className="text-base font-semibold text-stone-900 mt-0.5">
+                        {assignedMasterEvents
+                          .map(
+                            (m) =>
+                              `${m.name}${m.eventYear ? ` (${m.eventYear})` : ''}`
+                          )
+                          .join(', ')}
+                      </div>
                     </div>
-                    <div className="text-base font-semibold text-stone-900 mt-0.5">
-                      {assignedMasterEvents
-                        .map((m) => `${m.name}${m.eventYear ? ` (${m.eventYear})` : ''}`)
-                        .join(', ')}
+                    <div className="text-xs text-stone-500">
+                      Date: {todayStr} &middot; {scopedSubEvents.length}{' '}
+                      Sub-Event{scopedSubEvents.length === 1 ? '' : 's'}
                     </div>
                   </div>
-                  <div className="text-xs text-stone-500">
-                    Date: {todayStr} &middot; {scopedSubEvents.length} Sub-Event
-                    {scopedSubEvents.length === 1 ? '' : 's'}
+
+                  <div className="flex flex-wrap gap-2 pt-2 border-t border-sage-100">
+                    {assignedMasterEvents.map((m) => {
+                      const info = masterClosureEligibility.get(Number(m.id)) || {};
+                      return (
+                        <div
+                          key={m.id}
+                          className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-sage-50/70 border border-sage-200 text-xs"
+                        >
+                          <span className="font-medium text-stone-900">
+                            {m.name}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded border text-[10px] font-medium ${
+                              info.alreadyClosed
+                                ? 'bg-stone-200 text-stone-800 border-stone-300'
+                                : 'bg-white text-sage-800 border-sage-200'
+                            }`}
+                          >
+                            {info.alreadyClosed
+                              ? 'CLOSED (Read-Only)'
+                              : m.status || 'ACTIVE'}
+                          </span>
+                          {!info.alreadyClosed && info.canClose && (
+                            <button
+                              type="button"
+                              disabled={closingMasterId === m.id}
+                              onClick={() => handleCloseMasterEvent(m)}
+                              className="px-3 py-1 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-md text-xs font-medium cursor-pointer"
+                            >
+                              {closingMasterId === m.id
+                                ? 'Closing...'
+                                : 'Close Master Event'}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -411,25 +604,36 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                   <div className="space-y-6">
                     <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                       <div className="bg-white border border-sage-200 rounded-xl p-5">
-                        <div className="text-xs text-stone-500">Scoped Budget Cap</div>
+                        <div className="text-xs text-stone-500">
+                          Scoped Budget Cap
+                        </div>
                         <div className="text-2xl font-semibold text-stone-900 mt-1.5">
                           INR {totals.budget.toLocaleString('en-IN')}
                         </div>
                       </div>
                       <div className="bg-white border border-sage-200 rounded-xl p-5">
-                        <div className="text-xs text-stone-500">Approved Expenditure</div>
+                        <div className="text-xs text-stone-500">
+                          Approved Expenditure
+                        </div>
                         <div className="text-2xl font-semibold text-sage-800 mt-1.5">
                           INR {totals.spent.toLocaleString('en-IN')}
                         </div>
                       </div>
                       <div className="bg-white border border-sage-200 rounded-xl p-5">
-                        <div className="text-xs text-stone-500">Remaining Balance</div>
+                        <div className="text-xs text-stone-500">
+                          Remaining Balance
+                        </div>
                         <div className="text-2xl font-semibold text-stone-900 mt-1.5">
-                          INR {(totals.budget - totals.spent).toLocaleString('en-IN')}
+                          INR{' '}
+                          {(totals.budget - totals.spent).toLocaleString(
+                            'en-IN'
+                          )}
                         </div>
                       </div>
                       <div className="bg-white border border-sage-200 rounded-xl p-5">
-                        <div className="text-xs text-stone-500">Advance Disbursed</div>
+                        <div className="text-xs text-stone-500">
+                          Advance Disbursed
+                        </div>
                         <div className="text-2xl font-semibold text-stone-900 mt-1.5">
                           INR {totals.advance.toLocaleString('en-IN')}
                         </div>
@@ -444,12 +648,16 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                   </div>
                 )}
 
-                {(activeTab === 'pending' || activeTab === 'all') && (
+                {(activeTab === 'pending' ||
+                  activeTab === 'rejected' ||
+                  activeTab === 'all') && (
                   <section className="bg-white p-6 rounded-xl border border-sage-200 space-y-4">
                     <div className="flex items-center justify-between pb-3 border-b border-sage-100">
                       <h2 className="text-base font-semibold text-stone-900">
                         {activeTab === 'pending'
                           ? `Pending Main Event Head Review (${pendingMainHeadBills.length})`
+                          : activeTab === 'rejected'
+                          ? `Rejected / Stepped-Back Bills (${rejectedScopedBills.length})`
                           : `All Scoped Bills (${scopedBills.length})`}
                       </h2>
                     </div>
@@ -472,54 +680,71 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-sage-100">
-                            {displayedBills.map((bill) => (
-                              <tr key={bill.id} className="hover:bg-sage-50/50">
-                                <td className="py-3 px-4 font-mono text-xs text-stone-600">
-                                  {bill.billNo || bill.id}
-                                </td>
-                                <td className="py-3 px-4">
-                                  <span className="font-medium text-stone-900 block">
-                                    {bill.vendorName}
-                                  </span>
-                                  <span className="text-xs text-stone-500">
-                                    {bill.eventName || 'Sub-Event'}
-                                  </span>
-                                </td>
-                                <td className="py-3 px-4 font-medium text-stone-900">
-                                  INR {Number(bill.amount || 0).toFixed(2)}
-                                </td>
-                                <td className="py-3 px-4 text-xs text-stone-500">
-                                  {bill.billDate || 'N/A'}
-                                </td>
-                                <td className="py-3 px-4">
-                                  <span
-                                    className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
-                                      bill.status
-                                    )}`}
-                                  >
-                                    {bill.status}
-                                  </span>
-                                </td>
-                                <td className="py-3 px-4 text-center">
-                                  <div className="inline-flex items-center gap-2">
-                                    <button
-                                      onClick={() => handleOpenReview(bill)}
-                                      className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium transition cursor-pointer"
+                            {displayedBills.map((bill) => {
+                              const rejectedFlag = isSteppedBackOrRejected(bill);
+                              const parentClosed = isSubEventClosed(
+                                scopedSubEvents.find(
+                                  (se) => Number(se.id) === Number(bill.subEventId)
+                                )
+                              );
+                              const canReviewRow =
+                                !parentClosed &&
+                                bill.status === 'PENDING_MAIN_HEAD' &&
+                                !rejectedFlag;
+                              return (
+                                <tr
+                                  key={bill.id}
+                                  className="hover:bg-sage-50/50"
+                                >
+                                  <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                                    {bill.billNo || bill.id}
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <span className="font-medium text-stone-900 block">
+                                      {bill.vendorName}
+                                    </span>
+                                    <span className="text-xs text-stone-500">
+                                      {bill.eventName || 'Sub-Event'}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-4 font-medium text-stone-900">
+                                    INR {Number(bill.amount || 0).toFixed(2)}
+                                  </td>
+                                  <td className="py-3 px-4 text-xs text-stone-500">
+                                    {bill.billDate || 'N/A'}
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <span
+                                      className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
+                                        bill
+                                      )}`}
                                     >
-                                      {bill.status === 'PENDING_MAIN_HEAD'
-                                        ? 'Review & Edit'
-                                        : 'View'}
-                                    </button>
-                                    <button
-                                      onClick={() => setSelectedBillForAudit(bill.id)}
-                                      className="px-2.5 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
-                                    >
-                                      Logs
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            ))}
+                                      {rejectedFlag ? 'REJECTED' : bill.status}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-4 text-center">
+                                    <div className="inline-flex items-center gap-2">
+                                      <button
+                                        onClick={() => handleOpenReview(bill)}
+                                        className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium transition cursor-pointer"
+                                      >
+                                        {canReviewRow
+                                          ? 'Review & Edit'
+                                          : 'View'}
+                                      </button>
+                                      <button
+                                        onClick={() =>
+                                          setSelectedBillForAudit(bill.id)
+                                        }
+                                        className="px-2.5 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                      >
+                                        Logs
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
                           </tbody>
                         </table>
                       </div>
@@ -536,6 +761,7 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                     ) : (
                       scopedSubEvents.map((se) => {
                         const approvedSpent = getApprovedSpentForSubEvent(se.id);
+                        const closed = isSubEventClosed(se);
                         return (
                           <div
                             key={se.id}
@@ -543,9 +769,17 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                           >
                             <div>
                               <div className="flex items-start justify-between gap-2">
-                                <h3 className="font-semibold text-stone-900">{se.name}</h3>
-                                <span className="text-[11px] px-2 py-0.5 rounded bg-sage-50 border border-sage-200 text-sage-800 font-medium">
-                                  {se.status || 'OPEN'}
+                                <h3 className="font-semibold text-stone-900">
+                                  {se.name}
+                                </h3>
+                                <span
+                                  className={`text-[11px] px-2 py-0.5 rounded border font-medium ${
+                                    closed
+                                      ? 'bg-stone-100 border-stone-300 text-stone-800'
+                                      : 'bg-sage-50 border-sage-200 text-sage-800'
+                                  }`}
+                                >
+                                  {closed ? 'CLOSED' : se.status || 'ACTIVE'}
                                 </span>
                               </div>
                               <p className="text-xs text-stone-500 mt-1">
@@ -553,10 +787,14 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                               </p>
                               <div className="mt-3 text-xs text-stone-700 flex justify-between">
                                 <span>
-                                  Approved Spend: INR {approvedSpent.toLocaleString('en-IN')}
+                                  Approved Spend: INR{' '}
+                                  {approvedSpent.toLocaleString('en-IN')}
                                 </span>
                                 <span>
-                                  Cap: INR {(Number(se.budgetCap) || 0).toLocaleString('en-IN')}
+                                  Cap: INR{' '}
+                                  {(Number(se.budgetCap) || 0).toLocaleString(
+                                    'en-IN'
+                                  )}
                                 </span>
                               </div>
                             </div>
@@ -582,15 +820,21 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                     </h2>
                     <div className="flex justify-between py-2 border-b border-sage-100">
                       <span className="text-stone-500">Name</span>
-                      <span className="font-medium text-stone-900">{user?.name || '—'}</span>
+                      <span className="font-medium text-stone-900">
+                        {user?.name || '—'}
+                      </span>
                     </div>
                     <div className="flex justify-between py-2 border-b border-sage-100">
                       <span className="text-stone-500">Username</span>
-                      <span className="font-mono text-stone-800">{user?.username || '—'}</span>
+                      <span className="font-mono text-stone-800">
+                        {user?.username || '—'}
+                      </span>
                     </div>
                     <div className="flex justify-between py-2 border-b border-sage-100">
                       <span className="text-stone-500">Department</span>
-                      <span className="text-stone-800">{user?.department || '—'}</span>
+                      <span className="text-stone-800">
+                        {user?.department || '—'}
+                      </span>
                     </div>
                     <div className="flex justify-between py-2">
                       <span className="text-stone-500">Institutional ID</span>
@@ -611,9 +855,17 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
         <div className="fixed inset-0 bg-stone-900/40 flex items-center justify-center p-4 z-40">
           <div className="bg-white border border-sage-200 rounded-xl max-w-5xl w-full max-h-[88vh] overflow-y-auto p-6 space-y-5">
             <div className="flex items-center justify-between pb-3 border-b border-sage-100">
-              <h3 className="text-base font-semibold text-stone-900">
-                Folder: {selectedFolder.name}
-              </h3>
+              <div>
+                <h3 className="text-base font-semibold text-stone-900">
+                  Folder: {selectedFolder.name}
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Status:{' '}
+                  {isSubEventClosed(selectedFolder)
+                    ? 'CLOSED (Read-Only)'
+                    : selectedFolder.status || 'ACTIVE'}
+                </p>
+              </div>
               <button
                 type="button"
                 onClick={() => {
@@ -663,36 +915,49 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                     Bills in Folder ({folderBills.length})
                   </div>
                   {folderBills.length === 0 ? (
-                    <p className="text-xs text-stone-500">No bills linked to this folder.</p>
+                    <p className="text-xs text-stone-500">
+                      No bills linked to this folder.
+                    </p>
                   ) : (
                     <div className="border border-sage-200 rounded-lg divide-y divide-sage-100 text-xs">
-                      {folderBills.map((b) => (
-                        <div
-                          key={b.id}
-                          className="p-3 flex items-center justify-between gap-3"
-                        >
-                          <div>
-                            <div className="font-medium text-stone-900">
-                              {b.vendorName}{' '}
-                              <span className="font-mono text-stone-500">
-                                #{b.billNo || b.id}
-                              </span>
+                      {folderBills.map((b) => {
+                        const rejectedFlag = isSteppedBackOrRejected(b);
+                        return (
+                          <div
+                            key={b.id}
+                            className="p-3 flex items-center justify-between gap-3"
+                          >
+                            <div>
+                              <div className="font-medium text-stone-900">
+                                {b.vendorName}{' '}
+                                <span className="font-mono text-stone-500">
+                                  #{b.billNo || b.id}
+                                </span>
+                              </div>
+                              <div className="text-stone-500">
+                                Status:{' '}
+                                {rejectedFlag ? 'REJECTED' : b.status}
+                              </div>
                             </div>
-                            <div className="text-stone-500">Status: {b.status}</div>
+                            <div className="flex items-center gap-3">
+                              <span className="font-semibold text-stone-900">
+                                INR{' '}
+                                {Number(b.amount || 0).toLocaleString('en-IN')}
+                              </span>
+                              <button
+                                onClick={() => handleOpenReview(b)}
+                                className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded text-xs font-medium cursor-pointer"
+                              >
+                                {b.status === 'PENDING_MAIN_HEAD' &&
+                                !rejectedFlag &&
+                                !isSubEventClosed(selectedFolder)
+                                  ? 'Review'
+                                  : 'View'}
+                              </button>
+                            </div>
                           </div>
-                          <div className="flex items-center gap-3">
-                            <span className="font-semibold text-stone-900">
-                              INR {Number(b.amount || 0).toLocaleString('en-IN')}
-                            </span>
-                            <button
-                              onClick={() => handleOpenReview(b)}
-                              className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded text-xs font-medium cursor-pointer"
-                            >
-                              {b.status === 'PENDING_MAIN_HEAD' ? 'Review' : 'View'}
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -835,6 +1100,13 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                   </div>
                 </div>
 
+                {selectedBill.rejectionReason && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                    <strong className="text-rose-900">Rejection Reason:</strong>{' '}
+                    {selectedBill.rejectionReason}
+                  </div>
+                )}
+
                 {selectedBill.description && (
                   <div className="p-3 bg-sage-50 border border-sage-200 rounded-lg text-xs text-stone-600">
                     <strong className="text-stone-800">Prior Notes:</strong>{' '}
@@ -879,7 +1151,9 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
                     disabled={actionLoading}
                     className="px-4 py-2 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-lg text-xs font-medium cursor-pointer"
                   >
-                    {actionLoading ? 'Forwarding...' : 'Approve & Forward to Principal'}
+                    {actionLoading
+                      ? 'Forwarding...'
+                      : 'Approve & Forward to Principal'}
                   </button>
                 </>
               )}
@@ -892,7 +1166,9 @@ export default function MainEventHeadDashboard({ user, onLogout }) {
       {selectedBill && showRejectModal && (
         <div className="fixed inset-0 bg-stone-900/45 flex items-center justify-center p-4 z-50">
           <div className="bg-white w-full max-w-md rounded-xl border border-sage-200 p-6 space-y-4">
-            <h3 className="text-base font-semibold text-stone-900">Rejection Feedback</h3>
+            <h3 className="text-base font-semibold text-stone-900">
+              Rejection Feedback
+            </h3>
             <div>
               <label className="block text-xs font-medium text-stone-600 mb-1.5">
                 Reason

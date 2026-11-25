@@ -23,9 +23,19 @@ function extractYear(ev) {
   return 0;
 }
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
-  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
 
@@ -73,6 +83,20 @@ export default function MasterEventExplorer({
       null,
     [subEvents, selectedSubEventId]
   );
+
+  const isEventClosed = (ev) => {
+    if (!ev) return false;
+    if (String(ev.status || '').toUpperCase() === 'CLOSED') return true;
+    if (ev.parentEventId != null) {
+      const parent = masterEvents.find(
+        (m) => String(m.id) === String(ev.parentEventId)
+      );
+      if (parent && String(parent.status || '').toUpperCase() === 'CLOSED') {
+        return true;
+      }
+    }
+    return false;
+  };
 
   const groupedByYear = useMemo(() => {
     const map = new Map();
@@ -144,9 +168,10 @@ export default function MasterEventExplorer({
     );
 
   const getPendingCountForSubEvent = (se) => {
-    if (!pendingStatus) return 0;
-    return getBillsForSubEvent(se).filter((b) => b.status === pendingStatus)
-      .length;
+    if (!pendingStatus || isEventClosed(se)) return 0;
+    return getBillsForSubEvent(se).filter(
+      (b) => b.status === pendingStatus && !isSteppedBackOrRejected(b)
+    ).length;
   };
 
   const getPendingCountForMaster = (masterId) => {
@@ -166,6 +191,7 @@ export default function MasterEventExplorer({
     const approvedSpent = getApprovedSpendForSubEvent(selectedSubEvent);
     const balance = cap - approvedSpent;
     const masterYear = extractYear(selectedMaster) || 'Year';
+    const closed = isEventClosed(detail);
 
     return (
       <section className="bg-white border border-sage-200 rounded-xl shadow-[0_1px_3px_rgba(0,0,0,0.03)] overflow-hidden">
@@ -206,9 +232,15 @@ export default function MasterEventExplorer({
             </nav>
           </div>
 
-          <span className="text-[11px] font-medium px-2.5 py-1 bg-sage-100 border border-sage-200 text-sage-800 rounded-md">
+          <span
+            className={`text-[11px] font-medium px-2.5 py-1 rounded-md border ${
+              closed
+                ? 'bg-stone-100 border-stone-300 text-stone-800'
+                : 'bg-sage-100 border-sage-200 text-sage-800'
+            }`}
+          >
             {detail.department || 'Institutional'} &middot;{' '}
-            {detail.status || 'OPEN'}
+            {closed ? 'CLOSED (Read-Only)' : detail.status || 'OPEN'}
           </span>
         </div>
 
@@ -317,12 +349,16 @@ export default function MasterEventExplorer({
                 </thead>
                 <tbody className="divide-y divide-sage-100 text-stone-800">
                   {folderBills.map((b) => {
+                    const rejectedFlag = isSteppedBackOrRejected(b);
                     const label =
                       typeof reviewButtonLabel === 'function'
                         ? reviewButtonLabel(b)
                         : 'View';
                     const isPendingAction =
-                      pendingStatus && b.status === pendingStatus;
+                      !closed &&
+                      !rejectedFlag &&
+                      pendingStatus &&
+                      b.status === pendingStatus;
 
                     return (
                       <tr key={b.id} className="hover:bg-sage-50/40">
@@ -341,10 +377,10 @@ export default function MasterEventExplorer({
                         <td className="py-2.5 px-4">
                           <span
                             className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
-                              b.status
+                              b
                             )}`}
                           >
-                            {b.status}
+                            {rejectedFlag ? 'REJECTED' : b.status}
                           </span>
                         </td>
                         <td className="py-2.5 px-4 text-center">
@@ -401,6 +437,7 @@ export default function MasterEventExplorer({
     const masterApprovedSpent = getApprovedSpendForMaster(selectedMaster.id);
     const masterRemaining = masterCap - masterApprovedSpent;
     const masterYear = extractYear(selectedMaster) || 'Year';
+    const masterClosed = isEventClosed(selectedMaster);
 
     return (
       <section className="bg-white border border-sage-200 rounded-xl shadow-[0_1px_3px_rgba(0,0,0,0.03)] overflow-hidden">
@@ -435,10 +472,15 @@ export default function MasterEventExplorer({
             </nav>
           </div>
 
-          <span className="text-[11px] font-medium px-2.5 py-1 bg-sage-100 border border-sage-200 text-sage-800 rounded-md">
+          <span
+            className={`text-[11px] font-medium px-2.5 py-1 rounded-md border ${
+              masterClosed
+                ? 'bg-stone-100 border-stone-300 text-stone-800'
+                : 'bg-sage-100 border-sage-200 text-sage-800'
+            }`}
+          >
             {selectedMaster.wingName || 'Master Event'} &middot;{' '}
-            {childSubEvents.length} Sub-Event
-            {childSubEvents.length === 1 ? '' : 's'}
+            {masterClosed ? 'CLOSED' : `${childSubEvents.length} Sub-Event${childSubEvents.length === 1 ? '' : 's'}`}
           </span>
         </div>
 
@@ -489,6 +531,7 @@ export default function MasterEventExplorer({
                 const balance = cap - spent;
                 const billCount = getBillsForSubEvent(se).length;
                 const pendingCount = getPendingCountForSubEvent(se);
+                const closed = isEventClosed(se);
 
                 return (
                   <button
@@ -502,7 +545,11 @@ export default function MasterEventExplorer({
                         <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-sage-100 border border-sage-200 text-sage-800">
                           {se.department || 'Institutional'}
                         </span>
-                        {pendingCount > 0 ? (
+                        {closed ? (
+                          <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-stone-200 border border-stone-300 text-stone-800">
+                            CLOSED
+                          </span>
+                        ) : pendingCount > 0 ? (
                           <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800">
                             {pendingCount} pending
                           </span>
@@ -579,6 +626,7 @@ export default function MasterEventExplorer({
                 const cap = Number(m.budgetCap) || 0;
                 const spent = getApprovedSpendForMaster(m.id);
                 const pendingCount = getPendingCountForMaster(m.id);
+                const closed = isEventClosed(m);
 
                 return (
                   <button
@@ -595,7 +643,11 @@ export default function MasterEventExplorer({
                         <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-sage-100 border border-sage-200 text-sage-800">
                           {m.wingName || 'Master Event'}
                         </span>
-                        {pendingCount > 0 ? (
+                        {closed ? (
+                          <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-stone-200 border border-stone-300 text-stone-800">
+                            CLOSED
+                          </span>
+                        ) : pendingCount > 0 ? (
                           <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800">
                             {pendingCount} pending
                           </span>

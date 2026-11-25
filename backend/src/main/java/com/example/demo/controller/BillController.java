@@ -20,6 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.demo.entity.AuditLog;
 import com.example.demo.entity.Bill;
+import com.example.demo.entity.SubEvent;
 import com.example.demo.repository.AuditLogRepository;
 import com.example.demo.repository.BillRepository;
 import com.example.demo.repository.SubEventRepository;
@@ -53,6 +54,20 @@ public class BillController {
         }
     }
 
+    private boolean isSubEventOrParentClosed(Long subEventId) {
+        if (subEventId == null) return false;
+        Optional<SubEvent> subOpt = subEventRepository.findById(subEventId);
+        if (subOpt.isEmpty()) return false;
+        SubEvent sub = subOpt.get();
+        if ("CLOSED".equalsIgnoreCase(sub.getStatus())) return true;
+        if (sub.getParentEventId() != null) {
+            return subEventRepository.findById(sub.getParentEventId())
+                    .map(parent -> "CLOSED".equalsIgnoreCase(parent.getStatus()))
+                    .orElse(false);
+        }
+        return false;
+    }
+
     private String resolvePreviousStage(String currentStatus) {
         if (currentStatus == null) return "REJECTED";
         return switch (currentStatus.trim().toUpperCase()) {
@@ -82,6 +97,11 @@ public class BillController {
             if (bill.getVendorName() == null || bill.getVendorName().isBlank() || bill.getAmount() == null) {
                 return ResponseEntity.badRequest()
                         .body(Map.of("message", "Vendor name and amount are required."));
+            }
+
+            if (isSubEventOrParentClosed(bill.getSubEventId())) {
+                return ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(Map.of("message", "This event is CLOSED and read-only; no more bills can be submitted."));
             }
 
             if (bill.getBaseAmount() == null) bill.setBaseAmount(bill.getAmount());
@@ -143,6 +163,11 @@ public class BillController {
         }
 
         Bill bill = billOpt.get();
+        if (isSubEventOrParentClosed(bill.getSubEventId())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("message", "This event is CLOSED and read-only; no further changes are allowed."));
+        }
+
         String actorRole = payload.containsKey("role") && payload.get("role") != null
                 ? payload.get("role").toString().trim()
                 : "SYSTEM";
@@ -164,7 +189,6 @@ public class BillController {
                     .body(Map.of("message", "A rejection remark is compulsory when rejecting a bill."));
         }
 
-        // Allow OCR / receipt overrides for Faculty Head and Main Event Head
         if (canOverrideOcr(actorRole)) {
             if (payload.containsKey("vendorName") && payload.get("vendorName") != null) {
                 bill.setVendorName(payload.get("vendorName").toString().trim());
@@ -237,7 +261,6 @@ public class BillController {
                     : (existingDesc + " | [" + actorRole + "] " + remarkStr));
         }
 
-        // If the bill just reached final APPROVED status, compute its cumulative approved runningTotal
         if ("APPROVED".equalsIgnoreCase(bill.getStatus()) && bill.getSubEventId() != null) {
             double previousApproved = billRepository.findAll().stream()
                     .filter(b -> bill.getSubEventId().equals(b.getSubEventId()))
@@ -262,7 +285,6 @@ public class BillController {
             System.err.println("AuditLog write skipped: " + logEx.getMessage());
         }
 
-        // Recalculate SubEvent totalSpent strictly from APPROVED bills
         updateSubEventSpending(updated.getSubEventId());
 
         return ResponseEntity.ok(updated);
@@ -276,6 +298,11 @@ public class BillController {
         }
 
         Bill bill = billOpt.get();
+        if (isSubEventOrParentClosed(bill.getSubEventId())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("message", "This event is CLOSED and read-only; no more bill changes are allowed."));
+        }
+
         String remarkStr = payload.get("remark") != null ? payload.get("remark").toString().trim() : "";
         if (remarkStr.isEmpty()) {
             return ResponseEntity.badRequest()
@@ -323,7 +350,6 @@ public class BillController {
         return ResponseEntity.ok(saved);
     }
 
-    // Recalculate sub-event spending strictly from fully APPROVED bills
     private void updateSubEventSpending(Long subEventId) {
         if (subEventId != null) {
             subEventRepository.findById(subEventId).ifPresent(se -> {

@@ -6,16 +6,26 @@ import ReceiptPreviewPane from './ReceiptPreviewPane';
 import MasterEventExplorer from './MasterEventExplorer';
 import { MasterEventAnalytics } from './AnalyticsCharts';
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
-  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
 
 export default function PrincipalDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Queue' | 'Profile'
+  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Queue' | 'Rejected' | 'Profile'
   const [bills, setBills] = useState([]);
   const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -73,8 +83,26 @@ export default function PrincipalDashboard({ user, onLogout }) {
     setRejectionReason('Exceeds sanctioned budget cap');
   };
 
+  const isBillEventClosed = (bill) => {
+    if (!bill) return false;
+    const subId = bill.subEventId ?? bill.sub_event_id ?? bill.eventId ?? bill.event_id;
+    if (subId == null) return false;
+    const sub = allEvents.find((ev) => String(ev.id) === String(subId));
+    if (!sub) return false;
+    if (String(sub.status || '').toUpperCase() === 'CLOSED') return true;
+    if (sub.parentEventId != null) {
+      const parent = allEvents.find(
+        (ev) => String(ev.id) === String(sub.parentEventId)
+      );
+      if (parent && String(parent.status || '').toUpperCase() === 'CLOSED') {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const handleSanction = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isBillEventClosed(selectedBill)) return;
     setActionLoading(true);
     try {
       await backendApi.put(`/bills/${selectedBill.id}/status`, {
@@ -102,9 +130,9 @@ export default function PrincipalDashboard({ user, onLogout }) {
     }
   };
 
-  // Step-back rejection loop: compulsory remark, returns to previous stage (Main Event Head / Faculty / Coordinator)
+  // Step-back rejection loop: compulsory remark, returns to previous stage and appears in Rejected
   const handleConfirmReject = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isBillEventClosed(selectedBill)) return;
     if (!rejectionRemark.trim()) {
       showMessage(
         'error',
@@ -126,7 +154,7 @@ export default function PrincipalDashboard({ user, onLogout }) {
       });
       showMessage(
         'success',
-        `Bill #${selectedBill.billNo || selectedBill.id} stepped back with compulsory remark.`
+        `Bill #${selectedBill.billNo || selectedBill.id} stepped back and moved to Rejected bills.`
       );
       closeModals();
       await fetchData();
@@ -156,8 +184,10 @@ export default function PrincipalDashboard({ user, onLogout }) {
   );
 
   const pendingPrincipalBills = bills.filter(
-    (b) => b.status === 'PENDING_PRINCIPAL'
+    (b) => b.status === 'PENDING_PRINCIPAL' && !isSteppedBackOrRejected(b)
   );
+  const rejectedBills = bills.filter((b) => isSteppedBackOrRejected(b));
+
   const totalBudgetSanctioned = (
     masterEvents.length > 0 ? masterEvents : subEvents
   ).reduce((acc, ev) => acc + (Number(ev.budgetCap) || 0), 0);
@@ -172,11 +202,18 @@ export default function PrincipalDashboard({ user, onLogout }) {
       label: 'Sanction Queue',
       count: pendingPrincipalBills.length,
     },
+    { id: 'Rejected', label: 'Rejected Bills', count: rejectedBills.length },
     { id: 'Profile', label: 'Profile' },
   ];
 
   const inputClass =
     'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
+
+  const canActOnSelectedPrincipal =
+    selectedBill &&
+    !isBillEventClosed(selectedBill) &&
+    selectedBill.status === 'PENDING_PRINCIPAL' &&
+    !isSteppedBackOrRejected(selectedBill);
 
   return (
     <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
@@ -234,6 +271,8 @@ export default function PrincipalDashboard({ user, onLogout }) {
                     className={`text-xs px-2 py-0.5 rounded-md border ${
                       item.id === 'Queue' && item.count > 0
                         ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : item.id === 'Rejected' && item.count > 0
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
                         : 'bg-white text-stone-600 border-sage-200'
                     }`}
                   >
@@ -333,7 +372,9 @@ export default function PrincipalDashboard({ user, onLogout }) {
                     onReviewBill={(b) => setSelectedBill(b)}
                     onAuditLogs={(billId) => setSelectedBillForAudit(billId)}
                     reviewButtonLabel={(b) =>
-                      b.status === 'PENDING_PRINCIPAL'
+                      b.status === 'PENDING_PRINCIPAL' &&
+                      !isSteppedBackOrRejected(b) &&
+                      !isBillEventClosed(b)
                         ? 'Inspect & Sanction'
                         : 'View'
                     }
@@ -392,7 +433,7 @@ export default function PrincipalDashboard({ user, onLogout }) {
                             <td className="py-3 px-4">
                               <span
                                 className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
-                                  bill.status
+                                  bill
                                 )}`}
                               >
                                 {bill.status}
@@ -405,6 +446,79 @@ export default function PrincipalDashboard({ user, onLogout }) {
                                   className="px-3 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium cursor-pointer"
                                 >
                                   Inspect &amp; Sanction
+                                </button>
+                                <button
+                                  onClick={() => setSelectedBillForAudit(bill.id)}
+                                  className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  Logs
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* REJECTED / STEPPED-BACK BILLS TAB */}
+            {activeTab === 'Rejected' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Rejected &amp; Stepped-Back Bills ({rejectedBills.length})
+                </h2>
+
+                {rejectedBills.length === 0 ? (
+                  <div className="py-10 text-center bg-sage-50/50 border border-sage-200/80 rounded-lg text-xs text-stone-500">
+                    No rejected or stepped-back bills.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                    <table className="w-full text-left text-sm border-collapse">
+                      <thead>
+                        <tr className="border-b border-sage-200 bg-sage-50 text-stone-600 text-xs font-medium">
+                          <th className="py-3 px-4">Invoice No</th>
+                          <th className="py-3 px-4">Vendor &amp; Event</th>
+                          <th className="py-3 px-4">Amount</th>
+                          <th className="py-3 px-4">Remark / Reason</th>
+                          <th className="py-3 px-4 text-center">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-sage-100 text-stone-800">
+                        {rejectedBills.map((bill) => (
+                          <tr
+                            key={bill.id}
+                            className="hover:bg-sage-50/50 transition"
+                          >
+                            <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                              {bill.billNo || bill.id}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-medium text-stone-900 block">
+                                {bill.vendorName}
+                              </span>
+                              <span className="text-xs text-stone-500">
+                                {bill.eventName || 'General'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 font-medium text-stone-900">
+                              INR {Number(bill.amount || 0).toFixed(2)}
+                            </td>
+                            <td className="py-3 px-4 text-xs text-rose-700">
+                              {bill.rejectionReason ||
+                                bill.remark ||
+                                'Rejected / stepped back'}
+                            </td>
+                            <td className="py-3 px-4 text-center">
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  onClick={() => setSelectedBill(bill)}
+                                  className="px-3 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  View
                                 </button>
                                 <button
                                   onClick={() => setSelectedBillForAudit(bill.id)}
@@ -546,6 +660,13 @@ export default function PrincipalDashboard({ user, onLogout }) {
                   </div>
                 </div>
 
+                {selectedBill.rejectionReason && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                    <strong className="text-rose-900">Rejection Reason:</strong>{' '}
+                    {selectedBill.rejectionReason}
+                  </div>
+                )}
+
                 {selectedBill.description && (
                   <div className="p-3 bg-white border border-sage-200 rounded-lg text-xs text-stone-600">
                     <strong className="text-stone-800">
@@ -555,7 +676,7 @@ export default function PrincipalDashboard({ user, onLogout }) {
                   </div>
                 )}
 
-                {selectedBill.status === 'PENDING_PRINCIPAL' && (
+                {canActOnSelectedPrincipal && (
                   <div>
                     <label className="block text-xs font-medium text-stone-600 mb-1.5">
                       Sanction Note
@@ -579,7 +700,7 @@ export default function PrincipalDashboard({ user, onLogout }) {
               >
                 Close
               </button>
-              {selectedBill.status === 'PENDING_PRINCIPAL' && (
+              {canActOnSelectedPrincipal && (
                 <>
                   <button
                     onClick={() => setShowRejectModal(true)}

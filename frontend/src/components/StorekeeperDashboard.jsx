@@ -7,16 +7,26 @@ import ReceiptPreviewPane from './ReceiptPreviewPane';
 import MasterEventExplorer from './MasterEventExplorer';
 import { MasterEventAnalytics } from './AnalyticsCharts';
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') return 'bg-sage-100 text-sage-800 border-sage-200';
-  if (status === 'REJECTED') return 'bg-rose-50 text-rose-700 border-rose-200';
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
+    return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
+  }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
 
 export default function StorekeeperDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
-  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Queue' | 'Ledger' | 'Profile'
+  const [activeTab, setActiveTab] = useState('Folders'); // 'Folders' | 'Queue' | 'Rejected' | 'Ledger' | 'Profile'
   const [bills, setBills] = useState([]);
   const [allEvents, setAllEvents] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -79,8 +89,26 @@ export default function StorekeeperDashboard({ user, onLogout }) {
     setRejectionReason('Discrepancy in recorded ledger');
   };
 
+  const isBillEventClosed = (bill) => {
+    if (!bill) return false;
+    const subId = bill.subEventId ?? bill.sub_event_id ?? bill.eventId ?? bill.event_id;
+    if (subId == null) return false;
+    const sub = allEvents.find((ev) => String(ev.id) === String(subId));
+    if (!sub) return false;
+    if (String(sub.status || '').toUpperCase() === 'CLOSED') return true;
+    if (sub.parentEventId != null) {
+      const parent = allEvents.find(
+        (ev) => String(ev.id) === String(sub.parentEventId)
+      );
+      if (parent && String(parent.status || '').toUpperCase() === 'CLOSED') {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const handleStorekeeperApprove = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isBillEventClosed(selectedBill)) return;
     setActionLoading(true);
     try {
       await backendApi.put(`/bills/${selectedBill.id}/status`, {
@@ -108,9 +136,9 @@ export default function StorekeeperDashboard({ user, onLogout }) {
     }
   };
 
-  // Step-back rejection loop: compulsory remark, steps back to Principal stage
+  // Step-back rejection loop: compulsory remark, steps back to Principal stage and appears in Rejected
   const handleConfirmReject = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isBillEventClosed(selectedBill)) return;
     if (!rejectionRemark.trim()) {
       showMessage(
         'error',
@@ -132,7 +160,7 @@ export default function StorekeeperDashboard({ user, onLogout }) {
       });
       showMessage(
         'success',
-        `Bill #${selectedBill.billNo || selectedBill.id} rejected and stepped back with compulsory remark.`
+        `Bill #${selectedBill.billNo || selectedBill.id} rejected and moved to Rejected bills.`
       );
       closeModals();
       await fetchData();
@@ -147,13 +175,14 @@ export default function StorekeeperDashboard({ user, onLogout }) {
     }
   };
 
+  // Duplex-style 2-page PDF: Page 1 store register voucher, Page 2 attached bill receipt image
   const generateVoucherPdf = (bill) => {
     const doc = new jsPDF();
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(16);
     doc.text('GOVERNMENT COLLEGE OF ENGINEERING', 105, 20, { align: 'center' });
     doc.setFontSize(11);
-    doc.text('STORE REGISTER & AUDIT CERTIFICATION', 105, 28, {
+    doc.text('STORE REGISTER & AUDIT CERTIFICATION (PAGE 1 OF 2)', 105, 28, {
       align: 'center',
     });
     doc.line(15, 32, 195, 32);
@@ -194,6 +223,52 @@ export default function StorekeeperDashboard({ user, onLogout }) {
       110,
       96
     );
+
+    // Page 2: Attached Bill / Receipt Image
+    doc.addPage();
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(14);
+    doc.text('ATTACHED BILL / RECEIPT COPY (PAGE 2 OF 2)', 105, 20, {
+      align: 'center',
+    });
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(
+      `Invoice: ${bill.billNo || bill.id}  |  Vendor: ${bill.vendorName || 'N/A'}`,
+      105,
+      28,
+      { align: 'center' }
+    );
+    doc.line(15, 32, 195, 32);
+
+    const imgData = bill.receiptImage || '';
+    if (imgData && imgData.startsWith('data:image/')) {
+      try {
+        const format = imgData.includes('image/png') ? 'PNG' : 'JPEG';
+        doc.addImage(imgData, format, 20, 40, 170, 220, undefined, 'FAST');
+      } catch {
+        doc.text(
+          'Receipt image could not be rendered in PDF; refer to digital preview.',
+          105,
+          60,
+          { align: 'center' }
+        );
+      }
+    } else if (imgData && imgData.startsWith('data:application/pdf')) {
+      doc.text(
+        'Uploaded receipt was a PDF document; attach or view original PDF separately.',
+        105,
+        60,
+        { align: 'center' }
+      );
+    } else {
+      doc.text(
+        'No receipt image attached to this bill.',
+        105,
+        60,
+        { align: 'center' }
+      );
+    }
 
     doc.save(`Store_Voucher_${bill.billNo || bill.id}.pdf`);
   };
@@ -257,15 +332,23 @@ export default function StorekeeperDashboard({ user, onLogout }) {
     0
   );
   const pendingStorekeeperBills = bills.filter(
-    (b) => b.status === 'PENDING_STOREKEEPER'
+    (b) => b.status === 'PENDING_STOREKEEPER' && !isSteppedBackOrRejected(b)
   );
+  const rejectedBills = bills.filter((b) => isSteppedBackOrRejected(b));
   const totalApprovedOutflow = bills
     .filter((b) => b.status === 'APPROVED')
     .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
 
   const filteredMasterBills = bills.filter((b) => {
+    const isRejected = isSteppedBackOrRejected(b);
     const matchesStatus =
-      statusFilter === 'All' ? true : b.status === statusFilter;
+      statusFilter === 'All'
+        ? true
+        : statusFilter === 'REJECTED'
+        ? isRejected
+        : statusFilter === 'PENDING_STOREKEEPER'
+        ? b.status === 'PENDING_STOREKEEPER' && !isRejected
+        : b.status === statusFilter;
     const matchesSearch =
       b.vendorName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       b.billNo?.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -280,12 +363,19 @@ export default function StorekeeperDashboard({ user, onLogout }) {
       label: 'Storekeeper Queue',
       count: pendingStorekeeperBills.length,
     },
+    { id: 'Rejected', label: 'Rejected Bills', count: rejectedBills.length },
     { id: 'Ledger', label: 'Master Bills Ledger', count: bills.length },
     { id: 'Profile', label: 'Profile' },
   ];
 
   const inputClass =
     'w-full px-3.5 py-2 bg-white border border-sage-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:border-sage-500 focus:ring-2 focus:ring-sage-500/15 outline-none transition';
+
+  const canActOnSelectedStorekeeper =
+    selectedBill &&
+    !isBillEventClosed(selectedBill) &&
+    selectedBill.status === 'PENDING_STOREKEEPER' &&
+    !isSteppedBackOrRejected(selectedBill);
 
   return (
     <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
@@ -349,6 +439,8 @@ export default function StorekeeperDashboard({ user, onLogout }) {
                     className={`text-xs px-2 py-0.5 rounded-md border ${
                       item.id === 'Queue' && item.count > 0
                         ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : item.id === 'Rejected' && item.count > 0
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
                         : 'bg-white text-stone-600 border-sage-200'
                     }`}
                   >
@@ -459,7 +551,9 @@ export default function StorekeeperDashboard({ user, onLogout }) {
                     onDownloadPdf={(b) => generateVoucherPdf(b)}
                     onAuditLogs={(billId) => setSelectedBillForAudit(billId)}
                     reviewButtonLabel={(b) =>
-                      b.status === 'PENDING_STOREKEEPER'
+                      b.status === 'PENDING_STOREKEEPER' &&
+                      !isSteppedBackOrRejected(b) &&
+                      !isBillEventClosed(b)
                         ? 'Review & Log'
                         : 'View'
                     }
@@ -541,6 +635,85 @@ export default function StorekeeperDashboard({ user, onLogout }) {
               </section>
             )}
 
+            {/* REJECTED / STEPPED-BACK BILLS TAB */}
+            {activeTab === 'Rejected' && (
+              <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
+                <h2 className="text-base font-semibold text-stone-900 pb-3 border-b border-sage-100">
+                  Rejected &amp; Stepped-Back Bills ({rejectedBills.length})
+                </h2>
+
+                {rejectedBills.length === 0 ? (
+                  <div className="py-10 text-center bg-sage-50/50 border border-sage-200/80 rounded-lg text-xs text-stone-500">
+                    No rejected or stepped-back bills.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-sage-200 rounded-lg">
+                    <table className="w-full text-left text-sm border-collapse">
+                      <thead>
+                        <tr className="border-b border-sage-200 bg-sage-50 text-stone-600 text-xs font-medium">
+                          <th className="py-3 px-4">Invoice No</th>
+                          <th className="py-3 px-4">Vendor &amp; Event</th>
+                          <th className="py-3 px-4">Amount</th>
+                          <th className="py-3 px-4">Remark / Reason</th>
+                          <th className="py-3 px-4 text-center">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-sage-100 text-stone-800">
+                        {rejectedBills.map((b) => (
+                          <tr
+                            key={b.id}
+                            className="hover:bg-sage-50/50 transition"
+                          >
+                            <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                              {b.billNo || b.id}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-medium text-stone-900 block">
+                                {b.vendorName}
+                              </span>
+                              <span className="text-xs text-stone-500">
+                                {b.eventName || 'General'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 font-medium text-stone-900">
+                              INR {Number(b.amount || 0).toFixed(2)}
+                            </td>
+                            <td className="py-3 px-4 text-xs text-rose-700">
+                              {b.rejectionReason ||
+                                b.remark ||
+                                'Rejected / stepped back'}
+                            </td>
+                            <td className="py-3 px-4 text-center">
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  onClick={() => setSelectedBill(b)}
+                                  className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  View
+                                </button>
+                                <button
+                                  onClick={() => generateVoucherPdf(b)}
+                                  className="text-sage-700 text-xs font-medium hover:text-sage-900 cursor-pointer"
+                                >
+                                  PDF
+                                </button>
+                                <button
+                                  onClick={() => setSelectedBillForAudit(b.id)}
+                                  className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  Logs
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            )}
+
             {/* MASTER BILLS LEDGER TAB */}
             {activeTab === 'Ledger' && (
               <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
@@ -584,60 +757,65 @@ export default function StorekeeperDashboard({ user, onLogout }) {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-sage-100 text-stone-800">
-                      {filteredMasterBills.map((b) => (
-                        <tr
-                          key={b.id}
-                          className="hover:bg-sage-50/50 transition"
-                        >
-                          <td className="py-3 px-4 font-mono text-xs text-stone-600">
-                            {b.billNo || b.id}
-                          </td>
-                          <td className="py-3 px-4">
-                            <span className="font-medium text-stone-900 block">
-                              {b.vendorName}
-                            </span>
-                            <span className="text-xs text-stone-500">
-                              {b.eventName || 'General'}
-                            </span>
-                          </td>
-                          <td className="py-3 px-4 font-medium text-stone-900">
-                            INR {Number(b.amount || 0).toFixed(2)}
-                          </td>
-                          <td className="py-3 px-4">
-                            <span
-                              className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
-                                b.status
-                              )}`}
-                            >
-                              {b.status}
-                            </span>
-                          </td>
-                          <td className="py-3 px-4 text-center">
-                            <div className="inline-flex items-center gap-2">
-                              <button
-                                onClick={() => setSelectedBill(b)}
-                                className="px-2.5 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium cursor-pointer"
+                      {filteredMasterBills.map((b) => {
+                        const rejectedFlag = isSteppedBackOrRejected(b);
+                        return (
+                          <tr
+                            key={b.id}
+                            className="hover:bg-sage-50/50 transition"
+                          >
+                            <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                              {b.billNo || b.id}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-medium text-stone-900 block">
+                                {b.vendorName}
+                              </span>
+                              <span className="text-xs text-stone-500">
+                                {b.eventName || 'General'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 font-medium text-stone-900">
+                              INR {Number(b.amount || 0).toFixed(2)}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span
+                                className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
+                                  b
+                                )}`}
                               >
-                                {b.status === 'PENDING_STOREKEEPER'
-                                  ? 'Review'
-                                  : 'View'}
-                              </button>
-                              <button
-                                onClick={() => generateVoucherPdf(b)}
-                                className="text-sage-700 text-xs font-medium hover:text-sage-900 cursor-pointer"
-                              >
-                                PDF
-                              </button>
-                              <button
-                                onClick={() => setSelectedBillForAudit(b.id)}
-                                className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
-                              >
-                                Logs
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
+                                {rejectedFlag ? 'REJECTED' : b.status}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 text-center">
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  onClick={() => setSelectedBill(b)}
+                                  className="px-2.5 py-1 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  {b.status === 'PENDING_STOREKEEPER' &&
+                                  !rejectedFlag &&
+                                  !isBillEventClosed(b)
+                                    ? 'Review'
+                                    : 'View'}
+                                </button>
+                                <button
+                                  onClick={() => generateVoucherPdf(b)}
+                                  className="text-sage-700 text-xs font-medium hover:text-sage-900 cursor-pointer"
+                                >
+                                  PDF
+                                </button>
+                                <button
+                                  onClick={() => setSelectedBillForAudit(b.id)}
+                                  className="px-2.5 py-1 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium cursor-pointer"
+                                >
+                                  Logs
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -767,6 +945,13 @@ export default function StorekeeperDashboard({ user, onLogout }) {
                   </div>
                 </div>
 
+                {selectedBill.rejectionReason && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                    <strong className="text-rose-900">Rejection Reason:</strong>{' '}
+                    {selectedBill.rejectionReason}
+                  </div>
+                )}
+
                 {selectedBill.description && (
                   <div className="p-3 bg-white border border-sage-200 rounded-lg text-xs text-stone-600">
                     <strong className="text-stone-800">
@@ -776,7 +961,7 @@ export default function StorekeeperDashboard({ user, onLogout }) {
                   </div>
                 )}
 
-                {selectedBill.status === 'PENDING_STOREKEEPER' && (
+                {canActOnSelectedStorekeeper && (
                   <div>
                     <label className="block text-xs font-medium text-stone-600 mb-1.5">
                       Stock Register Note
@@ -800,7 +985,7 @@ export default function StorekeeperDashboard({ user, onLogout }) {
               >
                 Close
               </button>
-              {selectedBill.status === 'PENDING_STOREKEEPER' && (
+              {canActOnSelectedStorekeeper && (
                 <>
                   <button
                     onClick={() => {

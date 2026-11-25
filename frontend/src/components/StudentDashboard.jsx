@@ -12,8 +12,15 @@ const APPROVAL_STAGES = [
   { key: 'PENDING_STOREKEEPER', label: 'Storekeeper' },
 ];
 
-function getStageIndex(status) {
-  switch (status) {
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStageIndex(bill) {
+  if (isSteppedBackOrRejected(bill)) return -1;
+  switch (bill?.status) {
     case 'PENDING_FACULTY':
       return 0;
     case 'PENDING_MAIN_HEAD':
@@ -29,12 +36,12 @@ function getStageIndex(status) {
   }
 }
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') {
-    return 'bg-sage-100 text-sage-800 border-sage-200';
-  }
-  if (status === 'REJECTED') {
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
     return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
   }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
@@ -82,6 +89,7 @@ export default function StudentDashboard({ user, onLogout }) {
   const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState('summary'); // 'summary' | 'upload' | 'bills' | 'profile'
+  const [billFilter, setBillFilter] = useState('all'); // 'all' | 'pending' | 'approved' | 'rejected'
   const [currentUser, setCurrentUser] = useState(user);
   const [subEvent, setSubEvent] = useState(null);
   const [coordinatorList, setCoordinatorList] = useState([]);
@@ -90,6 +98,7 @@ export default function StudentDashboard({ user, onLogout }) {
 
   const [bills, setBills] = useState([]);
   const [loadingBills, setLoadingBills] = useState(false);
+  const [requestingClosure, setRequestingClosure] = useState(false);
 
   // Upload & OCR state
   const [selectedFile, setSelectedFile] = useState(null);
@@ -120,7 +129,6 @@ export default function StudentDashboard({ user, onLogout }) {
     }, 5000);
   };
 
-  // Shared across all Student Coordinators on the same sub-event
   const fetchBills = useCallback(async (targetSubEvent) => {
     const subEventId =
       typeof targetSubEvent === 'object' ? targetSubEvent?.id : targetSubEvent;
@@ -210,6 +218,45 @@ export default function StudentDashboard({ user, onLogout }) {
     fetchSubEventData();
   }, [fetchSubEventData]);
 
+  const isEventClosed =
+    String(subEvent?.status || '').toUpperCase() === 'CLOSED' ||
+    Boolean(subEvent?.readOnly);
+
+  const allBillsApproved =
+    bills.length > 0 && bills.every((b) => b.status === 'APPROVED');
+
+  const handleRequestSubEventClosure = async () => {
+    if (!subEvent?.id) return;
+    if (isEventClosed) {
+      showMessage('error', 'This sub-event is already CLOSED.');
+      return;
+    }
+    if (!allBillsApproved) {
+      showMessage(
+        'error',
+        'All bills in this sub-event must be approved before requesting closure.'
+      );
+      return;
+    }
+
+    setRequestingClosure(true);
+    try {
+      await backendApi.post(`/subevents/${subEvent.id}/request-closure`);
+      showMessage(
+        'success',
+        `Closure request raised for "${subEvent.name}". Awaiting Faculty Head and Student Head approval.`
+      );
+      await fetchSubEventData();
+    } catch (err) {
+      showMessage(
+        'error',
+        err.response?.data?.message || 'Failed to request sub-event closure.'
+      );
+    } finally {
+      setRequestingClosure(false);
+    }
+  };
+
   const resetForm = () => {
     setSelectedFile(null);
     setReceiptImage('');
@@ -226,6 +273,10 @@ export default function StudentDashboard({ user, onLogout }) {
   };
 
   const handleFileChange = async (e) => {
+    if (isEventClosed) {
+      showMessage('error', 'This sub-event is CLOSED and read-only.');
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -289,6 +340,14 @@ export default function StudentDashboard({ user, onLogout }) {
 
   const handleSubmitBill = async (e) => {
     e.preventDefault();
+
+    if (isEventClosed) {
+      showMessage(
+        'error',
+        'This sub-event is CLOSED and read-only; no more bills can be submitted.'
+      );
+      return;
+    }
 
     if (!subEvent?.id) {
       showMessage(
@@ -375,6 +434,10 @@ export default function StudentDashboard({ user, onLogout }) {
   };
 
   const openReuploadModal = (bill) => {
+    if (isEventClosed) {
+      showMessage('error', 'This sub-event is CLOSED and read-only.');
+      return;
+    }
     setSelectedRejectedBill(bill);
     setReceiptImage(bill.receiptImage || '');
     setVendorName(bill.vendorName || '');
@@ -389,13 +452,14 @@ export default function StudentDashboard({ user, onLogout }) {
     setReuploadRemark('');
   };
 
+  // Duplex-style 2-page PDF: Page 1 voucher summary, Page 2 attached bill receipt image
   const generateVoucherPdf = (bill) => {
     const doc = new jsPDF();
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(16);
     doc.text('GOVERNMENT COLLEGE OF ENGINEERING', 105, 20, { align: 'center' });
     doc.setFontSize(12);
-    doc.text('EXPENSE VOUCHER', 105, 28, { align: 'center' });
+    doc.text('EXPENSE VOUCHER (PAGE 1 OF 2)', 105, 28, { align: 'center' });
     doc.setLineWidth(0.5);
     doc.line(15, 32, 195, 32);
 
@@ -478,6 +542,52 @@ export default function StudentDashboard({ user, onLogout }) {
       sigY + 28
     );
 
+    // Page 2: Attached Bill / Receipt Image
+    doc.addPage();
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(14);
+    doc.text('ATTACHED BILL / RECEIPT COPY (PAGE 2 OF 2)', 105, 20, {
+      align: 'center',
+    });
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(
+      `Invoice: ${bill.billNo || bill.id}  |  Vendor: ${bill.vendorName || 'N/A'}`,
+      105,
+      28,
+      { align: 'center' }
+    );
+    doc.line(15, 32, 195, 32);
+
+    const imgData = bill.receiptImage || '';
+    if (imgData && imgData.startsWith('data:image/')) {
+      try {
+        const format = imgData.includes('image/png') ? 'PNG' : 'JPEG';
+        doc.addImage(imgData, format, 20, 40, 170, 220, undefined, 'FAST');
+      } catch {
+        doc.text(
+          'Receipt image could not be rendered in PDF; refer to digital preview.',
+          105,
+          60,
+          { align: 'center' }
+        );
+      }
+    } else if (imgData && imgData.startsWith('data:application/pdf')) {
+      doc.text(
+        'Uploaded receipt was a PDF document; attach or view original PDF separately.',
+        105,
+        60,
+        { align: 'center' }
+      );
+    } else {
+      doc.text(
+        'No receipt image attached to this bill.',
+        105,
+        60,
+        { align: 'center' }
+      );
+    }
+
     doc.save(`Voucher_${bill.billNo || bill.id}.pdf`);
   };
 
@@ -488,7 +598,21 @@ export default function StudentDashboard({ user, onLogout }) {
     navigate('/', { replace: true });
   };
 
-  const rejectedBills = bills.filter((b) => b.status === 'REJECTED');
+  const rejectedBills = bills.filter((b) => isSteppedBackOrRejected(b));
+  const pendingBills = bills.filter(
+    (b) => !isSteppedBackOrRejected(b) && b.status !== 'APPROVED'
+  );
+  const approvedBills = bills.filter((b) => b.status === 'APPROVED');
+
+  const displayedBills =
+    billFilter === 'rejected'
+      ? rejectedBills
+      : billFilter === 'pending'
+      ? pendingBills
+      : billFilter === 'approved'
+      ? approvedBills
+      : bills;
+
   const allocatedBudget = subEvent?.budgetCap ? Number(subEvent.budgetCap) : 0;
   const advancePayment = subEvent?.advanceDisbursed
     ? Number(subEvent.advanceDisbursed)
@@ -517,6 +641,7 @@ export default function StudentDashboard({ user, onLogout }) {
     { id: 'summary', label: 'Event Summary' },
     { id: 'upload', label: 'Upload Bill' },
     { id: 'bills', label: 'Track My Bills', count: bills.length },
+    { id: 'rejected', label: 'Rejected Bills', count: rejectedBills.length },
     { id: 'profile', label: 'Profile' },
   ];
 
@@ -563,16 +688,37 @@ export default function StudentDashboard({ user, onLogout }) {
             {navItems.map((item) => (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => {
+                  if (item.id === 'rejected') {
+                    setBillFilter('rejected');
+                    setActiveTab('bills');
+                  } else {
+                    if (item.id === 'bills' && billFilter === 'rejected') {
+                      setBillFilter('all');
+                    }
+                    setActiveTab(item.id);
+                  }
+                }}
                 className={`w-full text-left px-3.5 py-2.5 rounded-lg text-sm font-medium transition flex items-center justify-between cursor-pointer ${
-                  activeTab === item.id
+                  (item.id === 'rejected' &&
+                    activeTab === 'bills' &&
+                    billFilter === 'rejected') ||
+                  (item.id !== 'rejected' &&
+                    activeTab === item.id &&
+                    !(item.id === 'bills' && billFilter === 'rejected'))
                     ? 'bg-sage-100 text-sage-900 border border-sage-200'
                     : 'text-stone-600 hover:bg-sage-50 hover:text-stone-900'
                 }`}
               >
                 <span>{item.label}</span>
                 {item.count !== undefined && (
-                  <span className="text-xs px-2 py-0.5 rounded-md bg-white border border-sage-200 text-stone-600">
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-md border ${
+                      item.id === 'rejected' && item.count > 0
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
+                        : 'bg-white text-stone-600 border-sage-200'
+                    }`}
+                  >
                     {item.count}
                   </span>
                 )}
@@ -587,7 +733,14 @@ export default function StudentDashboard({ user, onLogout }) {
               {navItems.map((item) => (
                 <button
                   key={item.id}
-                  onClick={() => setActiveTab(item.id)}
+                  onClick={() => {
+                    if (item.id === 'rejected') {
+                      setBillFilter('rejected');
+                      setActiveTab('bills');
+                    } else {
+                      setActiveTab(item.id);
+                    }
+                  }}
                   className={`px-3.5 py-1.5 rounded-lg text-xs font-medium shrink-0 transition cursor-pointer ${
                     activeTab === item.id
                       ? 'bg-sage-600 text-white'
@@ -630,11 +783,52 @@ export default function StudentDashboard({ user, onLogout }) {
                           : 'Not Allotted Yet'}
                       </h2>
                     </div>
-                    <span className="text-xs font-medium px-3 py-1.5 bg-sage-50 border border-sage-200 text-sage-800 rounded-lg self-start sm:self-auto">
-                      Status:{' '}
-                      {subEvent ? subEvent.status || 'OPEN' : 'Unassigned'}
-                    </span>
+                    <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
+                      <span
+                        className={`text-xs font-medium px-3 py-1.5 rounded-lg border ${
+                          isEventClosed
+                            ? 'bg-stone-100 border-stone-300 text-stone-800'
+                            : 'bg-sage-50 border-sage-200 text-sage-800'
+                        }`}
+                      >
+                        Status:{' '}
+                        {subEvent ? subEvent.status || 'ACTIVE' : 'Unassigned'}
+                      </span>
+                      {subEvent?.id && !isEventClosed && allBillsApproved && (
+                        <button
+                          type="button"
+                          onClick={handleRequestSubEventClosure}
+                          disabled={requestingClosure}
+                          className="px-3.5 py-1.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white rounded-lg text-xs font-medium transition cursor-pointer"
+                        >
+                          {requestingClosure
+                            ? 'Requesting...'
+                            : 'Request Sub-Event Closure'}
+                        </button>
+                      )}
+                    </div>
                   </div>
+
+                  {isEventClosed && (
+                    <div className="px-3.5 py-2.5 bg-stone-100 border border-stone-300 rounded-lg text-xs text-stone-700">
+                      This sub-event is <strong>CLOSED</strong> and read-only. No further bills can be submitted or modified.
+                    </div>
+                  )}
+
+                  {!isEventClosed && subEvent?.closureRequested && (
+                    <div className="px-3.5 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">
+                      Closure requested. Faculty Head approval:{' '}
+                      <strong>
+                        {subEvent.facultyClosureApproved ? 'Approved' : 'Pending'}
+                      </strong>{' '}
+                      &middot; Student Head approval:{' '}
+                      <strong>
+                        {subEvent.studentHeadClosureApproved
+                          ? 'Approved'
+                          : 'Pending'}
+                      </strong>
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 border-t border-sage-100 text-sm">
                     <div>
@@ -681,7 +875,7 @@ export default function StudentDashboard({ user, onLogout }) {
                 {rejectedBills.length > 0 && (
                   <section className="bg-rose-50/70 border border-rose-200 rounded-xl p-5 space-y-3">
                     <h3 className="text-sm font-semibold text-rose-800">
-                      Action Required: Rejected Bills ({rejectedBills.length})
+                      Rejected / Stepped-Back Bills ({rejectedBills.length})
                     </h3>
                     <div className="space-y-2.5">
                       {rejectedBills.map((bill) => (
@@ -703,12 +897,14 @@ export default function StudentDashboard({ user, onLogout }) {
                                 'Correction required.'}
                             </p>
                           </div>
-                          <button
-                            onClick={() => openReuploadModal(bill)}
-                            className="px-3.5 py-1.5 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-medium transition cursor-pointer shrink-0"
-                          >
-                            Re-upload Bill
-                          </button>
+                          {!isEventClosed && (
+                            <button
+                              onClick={() => openReuploadModal(bill)}
+                              className="px-3.5 py-1.5 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-medium transition cursor-pointer shrink-0"
+                            >
+                              Re-upload Bill
+                            </button>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -778,200 +974,235 @@ export default function StudentDashboard({ user, onLogout }) {
                   </span>
                 </div>
 
-                <form onSubmit={handleSubmitBill} className="space-y-5">
-                  <div>
-                    <label className="block text-xs font-medium text-stone-600 mb-1.5">
-                      Receipt Document (Image / PDF) *
-                    </label>
-                    <div className="p-4 bg-sage-50/70 border border-dashed border-sage-300 rounded-lg space-y-3">
-                      <input
-                        type="file"
-                        accept="image/*,.pdf"
-                        onChange={handleFileChange}
-                        className="w-full text-xs text-stone-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border file:border-sage-200 file:text-xs file:font-medium file:bg-white file:text-sage-800 hover:file:bg-sage-100 file:cursor-pointer"
-                      />
-                      {selectedFile && (
-                        <p className="text-[11px] text-stone-500 truncate">
-                          Selected:{' '}
-                          <span className="font-medium text-stone-700">
-                            {selectedFile.name}
-                          </span>
-                        </p>
-                      )}
-                      {receiptImage &&
-                        !receiptImage.startsWith('data:application/pdf') && (
-                          <img
-                            src={receiptImage}
-                            alt="Uploaded receipt preview"
-                            className="max-h-48 rounded border border-sage-200 bg-white object-contain"
-                          />
+                {isEventClosed ? (
+                  <div className="p-5 bg-stone-100 border border-stone-300 rounded-lg text-xs text-stone-700">
+                    This sub-event is <strong>CLOSED</strong> and read-only. New bills cannot be uploaded.
+                  </div>
+                ) : (
+                  <form onSubmit={handleSubmitBill} className="space-y-5">
+                    <div>
+                      <label className="block text-xs font-medium text-stone-600 mb-1.5">
+                        Receipt Document (Image / PDF) *
+                      </label>
+                      <div className="p-4 bg-sage-50/70 border border-dashed border-sage-300 rounded-lg space-y-3">
+                        <input
+                          type="file"
+                          accept="image/*,.pdf"
+                          onChange={handleFileChange}
+                          className="w-full text-xs text-stone-600 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border file:border-sage-200 file:text-xs file:font-medium file:bg-white file:text-sage-800 hover:file:bg-sage-100 file:cursor-pointer"
+                        />
+                        {selectedFile && (
+                          <p className="text-[11px] text-stone-500 truncate">
+                            Selected:{' '}
+                            <span className="font-medium text-stone-700">
+                              {selectedFile.name}
+                            </span>
+                          </p>
                         )}
+                        {receiptImage &&
+                          !receiptImage.startsWith('data:application/pdf') && (
+                            <img
+                              src={receiptImage}
+                              alt="Uploaded receipt preview"
+                              className="max-h-48 rounded border border-sage-200 bg-white object-contain"
+                            />
+                          )}
+                      </div>
                     </div>
-                  </div>
 
-                  {isScanning && (
-                    <div className="px-3.5 py-2.5 bg-sage-50 border border-sage-200 rounded-lg text-xs text-sage-800">
-                      Scanning document and extracting fields...
+                    {isScanning && (
+                      <div className="px-3.5 py-2.5 bg-sage-50 border border-sage-200 rounded-lg text-xs text-sage-800">
+                        Scanning document and extracting fields...
+                      </div>
+                    )}
+
+                    <div className="px-3.5 py-2 bg-amber-50/70 border border-amber-200 rounded-lg text-[11px] text-amber-900">
+                      OCR fields below are auto-populated and read-only. Only Faculty Head and Main Event Head can override extracted values during review.
                     </div>
-                  )}
 
-                  <div className="px-3.5 py-2 bg-amber-50/70 border border-amber-200 rounded-lg text-[11px] text-amber-900">
-                    OCR fields below are auto-populated and read-only. Only Faculty Head and Main Event Head can override extracted values during review.
-                  </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Vendor Name (OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={vendorName}
+                          readOnly
+                          placeholder="Auto-filled after upload"
+                          className={readOnlyOcrClass}
+                        />
+                      </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Invoice Number (OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={billNo}
+                          readOnly
+                          placeholder="Auto-filled after upload"
+                          className={`${readOnlyOcrClass} font-mono`}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Bill Date (OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={billDate}
+                          readOnly
+                          placeholder="Auto-filled after upload"
+                          className={readOnlyOcrClass}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Vendor GSTIN (OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={vendorGstin}
+                          readOnly
+                          placeholder="Auto-filled after upload"
+                          className={`${readOnlyOcrClass} font-mono`}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Base Amount (INR, OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={baseAmount}
+                          readOnly
+                          placeholder="0.00"
+                          className={readOnlyOcrClass}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          Grand Total Amount (INR, OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={amount}
+                          readOnly
+                          placeholder="0.00"
+                          className={`${readOnlyOcrClass} font-semibold`}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          CGST (INR, OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={cgst}
+                          readOnly
+                          placeholder="0.00"
+                          className={readOnlyOcrClass}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-stone-600 mb-1">
+                          SGST (INR, OCR)
+                        </label>
+                        <input
+                          type="text"
+                          value={sgst}
+                          readOnly
+                          placeholder="0.00"
+                          className={readOnlyOcrClass}
+                        />
+                      </div>
+                    </div>
+
                     <div>
                       <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Vendor Name (OCR)
+                        Remarks (Optional)
                       </label>
-                      <input
-                        type="text"
-                        value={vendorName}
-                        readOnly
-                        placeholder="Auto-filled after upload"
-                        className={readOnlyOcrClass}
+                      <textarea
+                        rows={2}
+                        value={remarks}
+                        onChange={(e) => setRemarks(e.target.value)}
+                        placeholder="Optional notes about items purchased or OCR discrepancies for Faculty review..."
+                        className={inputClass}
                       />
                     </div>
 
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Invoice Number (OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={billNo}
-                        readOnly
-                        placeholder="Auto-filled after upload"
-                        className={`${readOnlyOcrClass} font-mono`}
-                      />
+                    <div className="flex items-center gap-3 pt-1">
+                      <button
+                        type="submit"
+                        disabled={
+                          isSubmitting || isScanning || !vendorName || !amount
+                        }
+                        className="px-6 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer disabled:cursor-not-allowed"
+                      >
+                        {isSubmitting ? 'Submitting...' : 'Submit for Approval'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={resetForm}
+                        className="px-4 py-2.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 text-sm font-medium rounded-lg transition cursor-pointer"
+                      >
+                        Clear
+                      </button>
                     </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Bill Date (OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={billDate}
-                        readOnly
-                        placeholder="Auto-filled after upload"
-                        className={readOnlyOcrClass}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Vendor GSTIN (OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={vendorGstin}
-                        readOnly
-                        placeholder="Auto-filled after upload"
-                        className={`${readOnlyOcrClass} font-mono`}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Base Amount (INR, OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={baseAmount}
-                        readOnly
-                        placeholder="0.00"
-                        className={readOnlyOcrClass}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        Grand Total Amount (INR, OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={amount}
-                        readOnly
-                        placeholder="0.00"
-                        className={`${readOnlyOcrClass} font-semibold`}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        CGST (INR, OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={cgst}
-                        readOnly
-                        placeholder="0.00"
-                        className={readOnlyOcrClass}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-stone-600 mb-1">
-                        SGST (INR, OCR)
-                      </label>
-                      <input
-                        type="text"
-                        value={sgst}
-                        readOnly
-                        placeholder="0.00"
-                        className={readOnlyOcrClass}
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-stone-600 mb-1">
-                      Remarks (Optional)
-                    </label>
-                    <textarea
-                      rows={2}
-                      value={remarks}
-                      onChange={(e) => setRemarks(e.target.value)}
-                      placeholder="Optional notes about items purchased or OCR discrepancies for Faculty review..."
-                      className={inputClass}
-                    />
-                  </div>
-
-                  <div className="flex items-center gap-3 pt-1">
-                    <button
-                      type="submit"
-                      disabled={
-                        isSubmitting || isScanning || !vendorName || !amount
-                      }
-                      className="px-6 py-2.5 bg-sage-600 hover:bg-sage-700 disabled:bg-sage-300 text-white text-sm font-medium rounded-lg transition cursor-pointer disabled:cursor-not-allowed"
-                    >
-                      {isSubmitting ? 'Submitting...' : 'Submit for Approval'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={resetForm}
-                      className="px-4 py-2.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 text-sm font-medium rounded-lg transition cursor-pointer"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                </form>
+                  </form>
+                )}
               </section>
             )}
 
             {/* TRACK MY BILLS TAB */}
             {activeTab === 'bills' && (
               <section className="bg-white p-6 rounded-xl border border-sage-200 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-4">
-                <div className="flex items-center justify-between pb-3 border-b border-sage-100">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-sage-100">
                   <div>
                     <h2 className="text-base font-semibold text-stone-900">
-                      Sub-Event Bills ({bills.length})
+                      {billFilter === 'rejected'
+                        ? `Rejected / Stepped-Back Bills (${rejectedBills.length})`
+                        : `Sub-Event Bills (${displayedBills.length})`}
                     </h2>
                     <p className="text-xs text-stone-500">
                       Visible to all Student Coordinators assigned to{' '}
                       {subEvent?.name || 'this sub-event'}.
                     </p>
+                  </div>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {[
+                      { id: 'all', label: `All (${bills.length})` },
+                      { id: 'pending', label: `Pending (${pendingBills.length})` },
+                      {
+                        id: 'rejected',
+                        label: `Rejected (${rejectedBills.length})`,
+                      },
+                      {
+                        id: 'approved',
+                        label: `Approved (${approvedBills.length})`,
+                      },
+                    ].map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setBillFilter(f.id)}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium border cursor-pointer ${
+                          billFilter === f.id
+                            ? 'bg-sage-600 text-white border-sage-600'
+                            : 'bg-white text-stone-600 border-sage-200 hover:bg-sage-50'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
                   </div>
                 </div>
 
@@ -979,15 +1210,15 @@ export default function StudentDashboard({ user, onLogout }) {
                   <div className="py-10 text-center text-xs text-stone-500">
                     Loading bills...
                   </div>
-                ) : bills.length === 0 ? (
+                ) : displayedBills.length === 0 ? (
                   <div className="py-10 px-4 text-center bg-sage-50/50 border border-sage-200/80 rounded-lg text-xs text-stone-500">
-                    No bills uploaded for this sub-event yet.
+                    No bills in this filter view.
                   </div>
                 ) : (
                   <div className="space-y-4">
-                    {bills.map((bill) => {
-                      const stageIdx = getStageIndex(bill.status);
-                      const isRejected = bill.status === 'REJECTED';
+                    {displayedBills.map((bill) => {
+                      const stageIdx = getStageIndex(bill);
+                      const isRejected = isSteppedBackOrRejected(bill);
 
                       return (
                         <div
@@ -1005,10 +1236,10 @@ export default function StudentDashboard({ user, onLogout }) {
                                 </span>
                                 <span
                                   className={`px-2 py-0.5 text-[11px] font-medium rounded-md border ${getStatusBadgeClass(
-                                    bill.status
+                                    bill
                                   )}`}
                                 >
-                                  {bill.status}
+                                  {isRejected ? 'REJECTED' : bill.status}
                                 </span>
                               </div>
                               <p className="text-xs text-stone-500 mt-1">
@@ -1056,12 +1287,14 @@ export default function StudentDashboard({ user, onLogout }) {
                                   bill.remark ||
                                   'Returned for correction.'}
                               </span>
-                              <button
-                                onClick={() => openReuploadModal(bill)}
-                                className="px-3 py-1 bg-white border border-rose-200 text-rose-700 rounded-md font-medium hover:bg-rose-50 cursor-pointer self-start sm:self-auto"
-                              >
-                                Re-upload Bill
-                              </button>
+                              {!isEventClosed && (
+                                <button
+                                  onClick={() => openReuploadModal(bill)}
+                                  className="px-3 py-1 bg-white border border-rose-200 text-rose-700 rounded-md font-medium hover:bg-rose-50 cursor-pointer self-start sm:self-auto"
+                                >
+                                  Re-upload Bill
+                                </button>
+                              )}
                             </div>
                           ) : (
                             <div className="grid grid-cols-4 gap-2 pt-2 border-t border-sage-200/70">

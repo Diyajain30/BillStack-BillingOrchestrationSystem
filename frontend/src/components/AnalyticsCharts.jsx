@@ -32,6 +32,12 @@ function formatINR(value) {
   })}`;
 }
 
+function isBillRejectedOrSteppedBack(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
 /**
  * Shared Sub-Event Analytics (Student Coordinator, Faculty Head, and Sub-Event Drill-Down)
  * 1) Semi-circle budget utilization meter (<80% sage, 80-90% orange, >90% red)
@@ -52,7 +58,9 @@ export function SubEventAnalytics({ allocatedBudget = 0, bills = [] }) {
   const inProcessSpend = useMemo(
     () =>
       bills
-        .filter((b) => b.status !== 'APPROVED' && b.status !== 'REJECTED')
+        .filter(
+          (b) => b.status !== 'APPROVED' && !isBillRejectedOrSteppedBack(b)
+        )
         .reduce((sum, b) => sum + (Number(b.amount) || 0), 0),
     [bills]
   );
@@ -85,7 +93,7 @@ export function SubEventAnalytics({ allocatedBudget = 0, bills = [] }) {
     const filtered =
       vendorScope === 'approved'
         ? bills.filter((b) => b.status === 'APPROVED')
-        : bills.filter((b) => b.status !== 'REJECTED');
+        : bills.filter((b) => !isBillRejectedOrSteppedBack(b));
 
     const map = {};
     for (const b of filtered) {
@@ -117,8 +125,10 @@ export function SubEventAnalytics({ allocatedBudget = 0, bills = [] }) {
   const statusStats = useMemo(() => {
     const total = bills.length;
     const approved = bills.filter((b) => b.status === 'APPROVED').length;
-    const rejected = bills.filter((b) => b.status === 'REJECTED').length;
-    const inProcess = total - approved - rejected;
+    const rejected = bills.filter((b) =>
+      isBillRejectedOrSteppedBack(b)
+    ).length;
+    const inProcess = Math.max(total - approved - rejected, 0);
 
     return {
       total,
@@ -434,7 +444,9 @@ export function MasterEventAnalytics({
   const inProcessSpend = useMemo(
     () =>
       masterBills
-        .filter((b) => b.status !== 'APPROVED' && b.status !== 'REJECTED')
+        .filter(
+          (b) => b.status !== 'APPROVED' && !isBillRejectedOrSteppedBack(b)
+        )
         .reduce((sum, b) => sum + (Number(b.amount) || 0), 0),
     [masterBills]
   );

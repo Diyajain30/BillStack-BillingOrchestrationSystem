@@ -5,12 +5,18 @@ import AuditLogModal from './AuditLogModal';
 import ReceiptPreviewPane from './ReceiptPreviewPane';
 import { SubEventAnalytics } from './AnalyticsCharts';
 
-function getStatusBadgeClass(status) {
-  if (status === 'APPROVED') {
-    return 'bg-sage-100 text-sage-800 border-sage-200';
-  }
-  if (status === 'REJECTED') {
+function isSteppedBackOrRejected(bill) {
+  if (!bill) return false;
+  if (bill.status === 'REJECTED') return true;
+  return Boolean(bill.rejectionReason || bill.rejectedBy);
+}
+
+function getStatusBadgeClass(bill) {
+  if (isSteppedBackOrRejected(bill)) {
     return 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  if (bill?.status === 'APPROVED') {
+    return 'bg-sage-100 text-sage-800 border-sage-200';
   }
   return 'bg-amber-50 text-amber-800 border-amber-200';
 }
@@ -56,7 +62,6 @@ export default function FacultyDashboard({ user, onLogout }) {
     }, 5000);
   };
 
-  // Shared across all Faculty Heads on the same sub-event
   const fetchBills = useCallback(async (targetSubEvent) => {
     const subEventId =
       typeof targetSubEvent === 'object' ? targetSubEvent?.id : targetSubEvent;
@@ -126,6 +131,10 @@ export default function FacultyDashboard({ user, onLogout }) {
       )
     : [];
 
+  const isEventClosed =
+    String(subEvent?.status || '').toUpperCase() === 'CLOSED' ||
+    Boolean(subEvent?.readOnly);
+
   // Budget totals calculated strictly from fully APPROVED bills
   const allocatedBudget = subEvent?.budgetCap ? Number(subEvent.budgetCap) : 0;
   const advancePayment = subEvent?.advanceDisbursed
@@ -137,30 +146,34 @@ export default function FacultyDashboard({ user, onLogout }) {
   const remainingBalance = allocatedBudget - totalExpenditure;
 
   const pendingCount = scopedBills.filter(
-    (b) => b.status === 'PENDING_FACULTY'
+    (b) => b.status === 'PENDING_FACULTY' && !isSteppedBackOrRejected(b)
   ).length;
   const approvedCount = scopedBills.filter(
     (b) =>
-      b.status === 'PENDING_MAIN_HEAD' ||
-      b.status === 'PENDING_PRINCIPAL' ||
-      b.status === 'PENDING_STOREKEEPER' ||
-      b.status === 'APPROVED'
+      !isSteppedBackOrRejected(b) &&
+      (b.status === 'PENDING_MAIN_HEAD' ||
+        b.status === 'PENDING_PRINCIPAL' ||
+        b.status === 'PENDING_STOREKEEPER' ||
+        b.status === 'APPROVED')
   ).length;
-  const rejectedCount = scopedBills.filter(
-    (b) => b.status === 'REJECTED'
+  const rejectedCount = scopedBills.filter((b) =>
+    isSteppedBackOrRejected(b)
   ).length;
 
   const filteredBills = scopedBills.filter((b) => {
-    if (activeTab === 'pending') return b.status === 'PENDING_FACULTY';
+    if (activeTab === 'pending') {
+      return b.status === 'PENDING_FACULTY' && !isSteppedBackOrRejected(b);
+    }
     if (activeTab === 'approved') {
       return (
-        b.status === 'PENDING_MAIN_HEAD' ||
-        b.status === 'PENDING_PRINCIPAL' ||
-        b.status === 'PENDING_STOREKEEPER' ||
-        b.status === 'APPROVED'
+        !isSteppedBackOrRejected(b) &&
+        (b.status === 'PENDING_MAIN_HEAD' ||
+          b.status === 'PENDING_PRINCIPAL' ||
+          b.status === 'PENDING_STOREKEEPER' ||
+          b.status === 'APPROVED')
       );
     }
-    if (activeTab === 'rejected') return b.status === 'REJECTED';
+    if (activeTab === 'rejected') return isSteppedBackOrRejected(b);
     return true;
   });
 
@@ -187,7 +200,7 @@ export default function FacultyDashboard({ user, onLogout }) {
   };
 
   const handleApprove = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isEventClosed) return;
     setActionLoading(true);
     try {
       const payload = {
@@ -224,7 +237,7 @@ export default function FacultyDashboard({ user, onLogout }) {
   };
 
   const handleConfirmReject = async () => {
-    if (!selectedBill) return;
+    if (!selectedBill || isEventClosed) return;
     if (!rejectionRemark.trim()) {
       showMessage(
         'error',
@@ -246,7 +259,7 @@ export default function FacultyDashboard({ user, onLogout }) {
       });
       showMessage(
         'success',
-        `Bill #${selectedBill.billNo || selectedBill.id} rejected and returned to Coordinator.`
+        `Bill #${selectedBill.billNo || selectedBill.id} rejected and moved to Rejected bills.`
       );
       closeModals();
       await fetchSubEventData();
@@ -262,13 +275,14 @@ export default function FacultyDashboard({ user, onLogout }) {
   };
 
   const handleVerifyClosure = async () => {
-    if (!subEvent?.id) return;
+    if (!subEvent?.id || isEventClosed) return;
     setActionLoading(true);
     try {
       await backendApi.put(`/subevents/${subEvent.id}/verify-closure`, {
         role: 'FACULTY',
+        userId: String(currentUser?.id || ''),
       });
-      showMessage('success', `Closure verified for "${subEvent.name}".`);
+      showMessage('success', `Closure approval recorded for "${subEvent.name}".`);
       await fetchSubEventData();
     } catch (err) {
       showMessage(
@@ -303,10 +317,13 @@ export default function FacultyDashboard({ user, onLogout }) {
     pending: 'Pending Approvals',
     all: 'All Bills',
     approved: 'Forwarded & Approved Bills',
-    rejected: 'Rejected Bills',
+    rejected: 'Rejected & Stepped-Back Bills',
   };
 
-  const isPendingFaculty = selectedBill?.status === 'PENDING_FACULTY';
+  const isPendingFaculty =
+    !isEventClosed &&
+    selectedBill?.status === 'PENDING_FACULTY' &&
+    !isSteppedBackOrRejected(selectedBill);
 
   return (
     <div className="min-h-screen bg-sage-50 text-stone-800 flex flex-col font-sans">
@@ -364,6 +381,8 @@ export default function FacultyDashboard({ user, onLogout }) {
                     className={`text-xs px-2 py-0.5 rounded-md border ${
                       item.id === 'pending' && item.count > 0
                         ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : item.id === 'rejected' && item.count > 0
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
                         : 'bg-white text-stone-600 border-sage-200'
                     }`}
                   >
@@ -424,11 +443,23 @@ export default function FacultyDashboard({ user, onLogout }) {
                           : 'Unassigned'}
                       </h2>
                     </div>
-                    <span className="text-xs font-medium px-3 py-1.5 bg-sage-50 border border-sage-200 text-sage-800 rounded-lg self-start sm:self-auto">
+                    <span
+                      className={`text-xs font-medium px-3 py-1.5 rounded-lg self-start sm:self-auto border ${
+                        isEventClosed
+                          ? 'bg-stone-100 border-stone-300 text-stone-800'
+                          : 'bg-sage-50 border-sage-200 text-sage-800'
+                      }`}
+                    >
                       Status:{' '}
-                      {subEvent ? subEvent.status || 'OPEN' : 'Unassigned'}
+                      {subEvent ? subEvent.status || 'ACTIVE' : 'Unassigned'}
                     </span>
                   </div>
+
+                  {isEventClosed && (
+                    <div className="px-3.5 py-2.5 bg-stone-100 border border-stone-300 rounded-lg text-xs text-stone-700">
+                      This sub-event is <strong>CLOSED</strong> and read-only.
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 border-t border-sage-100 text-sm">
                     <div>
@@ -466,7 +497,8 @@ export default function FacultyDashboard({ user, onLogout }) {
                   </div>
                 </section>
 
-                {subEvent?.closureRequested &&
+                {!isEventClosed &&
+                  subEvent?.closureRequested &&
                   !subEvent?.facultyClosureApproved && (
                     <section className="bg-amber-50/70 border border-amber-200 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                       <div>
@@ -475,7 +507,13 @@ export default function FacultyDashboard({ user, onLogout }) {
                         </h3>
                         <p className="text-xs text-amber-800 mt-0.5">
                           Review approved spend and confirm closure for{' '}
-                          {subEvent.name}.
+                          {subEvent.name}. Student Head approval:{' '}
+                          <strong>
+                            {subEvent.studentHeadClosureApproved
+                              ? 'Approved'
+                              : 'Pending'}
+                          </strong>
+                          .
                         </p>
                       </div>
                       <button
@@ -550,7 +588,8 @@ export default function FacultyDashboard({ user, onLogout }) {
                     {tabTitles[activeTab]} ({filteredBills.length})
                   </h2>
                   <span className="text-xs font-medium text-sage-800 bg-sage-50 px-2.5 py-1 rounded-md border border-sage-200 self-start sm:self-auto">
-                    Sub-Event: {subEvent ? subEvent.name : 'Unassigned'}
+                    Sub-Event: {subEvent ? subEvent.name : 'Unassigned'} (
+                    {subEvent?.status || 'ACTIVE'})
                   </span>
                 </div>
 
@@ -577,64 +616,69 @@ export default function FacultyDashboard({ user, onLogout }) {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-sage-100 text-stone-800">
-                        {filteredBills.map((bill) => (
-                          <tr
-                            key={bill.id}
-                            className="hover:bg-sage-50/50 transition"
-                          >
-                            <td className="py-3 px-4 font-mono text-xs text-stone-600">
-                              {bill.billNo || bill.id}
-                            </td>
-                            <td className="py-3 px-4">
-                              <span className="font-medium text-stone-900 block">
-                                {bill.vendorName}
-                              </span>
-                              <span className="text-xs text-stone-500">
-                                {bill.eventName}
-                              </span>
-                            </td>
-                            <td className="py-3 px-4 font-medium text-stone-900">
-                              INR {Number(bill.amount || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 px-4 text-stone-600 text-xs">
-                              {bill.status === 'APPROVED'
-                                ? `INR ${Number(
-                                    bill.runningTotal || 0
-                                  ).toFixed(2)}`
-                                : '—'}
-                            </td>
-                            <td className="py-3 px-4 text-stone-500 text-xs">
-                              {bill.billDate || 'N/A'}
-                            </td>
-                            <td className="py-3 px-4">
-                              <span
-                                className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
-                                  bill.status
-                                )}`}
-                              >
-                                {bill.status}
-                              </span>
-                            </td>
-                            <td className="py-3 px-4 text-center">
-                              <div className="inline-flex items-center gap-2">
-                                <button
-                                  onClick={() => handleOpenReview(bill)}
-                                  className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium transition cursor-pointer"
+                        {filteredBills.map((bill) => {
+                          const rejectedFlag = isSteppedBackOrRejected(bill);
+                          const canReviewRow =
+                            !isEventClosed &&
+                            bill.status === 'PENDING_FACULTY' &&
+                            !rejectedFlag;
+                          return (
+                            <tr
+                              key={bill.id}
+                              className="hover:bg-sage-50/50 transition"
+                            >
+                              <td className="py-3 px-4 font-mono text-xs text-stone-600">
+                                {bill.billNo || bill.id}
+                              </td>
+                              <td className="py-3 px-4">
+                                <span className="font-medium text-stone-900 block">
+                                  {bill.vendorName}
+                                </span>
+                                <span className="text-xs text-stone-500">
+                                  {bill.eventName}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 font-medium text-stone-900">
+                                INR {Number(bill.amount || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 px-4 text-stone-600 text-xs">
+                                {bill.status === 'APPROVED'
+                                  ? `INR ${Number(
+                                      bill.runningTotal || 0
+                                    ).toFixed(2)}`
+                                  : '—'}
+                              </td>
+                              <td className="py-3 px-4 text-xs text-stone-500">
+                                {bill.billDate || 'N/A'}
+                              </td>
+                              <td className="py-3 px-4">
+                                <span
+                                  className={`px-2 py-0.5 rounded-md border text-[11px] font-medium ${getStatusBadgeClass(
+                                    bill
+                                  )}`}
                                 >
-                                  {bill.status === 'PENDING_FACULTY'
-                                    ? 'Review & Edit'
-                                    : 'View'}
-                                </button>
-                                <button
-                                  onClick={() => setSelectedBillForAudit(bill.id)}
-                                  className="px-2.5 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium transition cursor-pointer"
-                                >
-                                  Logs
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                                  {rejectedFlag ? 'REJECTED' : bill.status}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 text-center">
+                                <div className="inline-flex items-center gap-2">
+                                  <button
+                                    onClick={() => handleOpenReview(bill)}
+                                    className="px-3 py-1.5 bg-sage-600 hover:bg-sage-700 text-white rounded-md text-xs font-medium transition cursor-pointer"
+                                  >
+                                    {canReviewRow ? 'Review & Edit' : 'View'}
+                                  </button>
+                                  <button
+                                    onClick={() => setSelectedBillForAudit(bill.id)}
+                                    className="px-2.5 py-1.5 bg-white hover:bg-sage-50 border border-sage-200 text-stone-700 rounded-md text-xs font-medium transition cursor-pointer"
+                                  >
+                                    Logs
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -818,6 +862,13 @@ export default function FacultyDashboard({ user, onLogout }) {
                     />
                   </div>
                 </div>
+
+                {selectedBill.rejectionReason && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700">
+                    <strong className="text-rose-900">Rejection Reason:</strong>{' '}
+                    {selectedBill.rejectionReason}
+                  </div>
+                )}
 
                 {selectedBill.description && (
                   <div className="p-3 bg-sage-50 border border-sage-200 rounded-lg text-xs text-stone-600">
